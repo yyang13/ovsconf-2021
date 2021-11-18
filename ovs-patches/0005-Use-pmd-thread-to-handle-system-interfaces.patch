@@ -1,0 +1,152 @@
+From 7eecfd55357f668aee1c9e4968be6a5c101e58c8 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 13 Aug 2020 03:15:43 -0400
+Subject: [PATCH 05/47] Use pmd thread to handle system interfaces
+
+Currently all the interfaces are handled by single
+thread ovs-vswitchd in userspace datapath, this is
+unscalable, especially in Openstack case, there are
+many tap and veth interfaces attached to bridge to
+handle routing and floating ip.
+
+But ovs-netdev can't be handled by pmd thread,
+otherwise, it will result in deadlock. Bridge itself
+also needn't pmd thread to handle, that is unnecessary.
+
+This patch enabled pmd support for tap and other
+system interfacses, it can make sure performance
+scalability, more pdm threads, more scalable, better
+performance.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dpif-netdev.c     | 3 +++
+ lib/netdev-linux.c    | 4 ++--
+ lib/netdev-provider.h | 1 +
+ lib/netdev.c          | 8 +++++++-
+ lib/netdev.h          | 1 +
+ vswitchd/bridge.c     | 9 +++++++--
+ 6 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 02df8f11e..493cc1d0a 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -2110,6 +2110,9 @@ do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
+     if (error) {
+         return error;
+     }
++    if (port_no == ODPP_LOCAL) {
++        netdev_set_internal(port->netdev);
++    }
+ 
+     hmap_insert(&dp->ports, &port->node, hash_port_no(port_no));
+     seq_change(dp->port_seq);
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index d8a035ac3..25effc565 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -3575,7 +3575,7 @@ exit:
+ const struct netdev_class netdev_linux_class = {
+     NETDEV_LINUX_CLASS_COMMON,
+     .type = "system",
+-    .is_pmd = false,
++    .is_pmd = true,
+     .construct = netdev_linux_construct,
+     .destruct = netdev_linux_destruct,
+     .get_stats = netdev_linux_get_stats,
+@@ -3591,7 +3591,7 @@ const struct netdev_class netdev_linux_class = {
+ const struct netdev_class netdev_tap_class = {
+     NETDEV_LINUX_CLASS_COMMON,
+     .type = "tap",
+-    .is_pmd = false,
++    .is_pmd = true,
+     .construct = netdev_linux_construct_tap,
+     .destruct = netdev_linux_destruct,
+     .get_stats = netdev_tap_get_stats,
+diff --git a/lib/netdev-provider.h b/lib/netdev-provider.h
+index d616d791e..6660e5b5a 100644
+--- a/lib/netdev-provider.h
++++ b/lib/netdev-provider.h
+@@ -55,6 +55,7 @@ struct netdev {
+     char *name;                         /* Name of network device. */
+     const struct netdev_class *netdev_class; /* Functions to control
+                                                 this device. */
++    bool is_internal; /* Is interface type internal? */
+ 
+     /* If this is 'true' the user did not specify a netdev_class when
+      * opening this device, and therefore got assigned to the "system" class */
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 02f28c81f..22593c679 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -125,7 +125,13 @@ netdev_n_rxq(const struct netdev *netdev)
+ bool
+ netdev_is_pmd(const struct netdev *netdev)
+ {
+-    return netdev->netdev_class->is_pmd;
++    return netdev->is_internal ? false: netdev->netdev_class->is_pmd;
++}
++
++void
++netdev_set_internal(struct netdev *netdev)
++{
++    netdev->is_internal = true;
+ }
+ 
+ bool
+diff --git a/lib/netdev.h b/lib/netdev.h
+index fb5073056..f7cdfdab7 100644
+--- a/lib/netdev.h
++++ b/lib/netdev.h
+@@ -150,6 +150,7 @@ bool netdev_is_reserved_name(const char *name);
+ int netdev_n_txq(const struct netdev *netdev);
+ int netdev_n_rxq(const struct netdev *netdev);
+ bool netdev_is_pmd(const struct netdev *netdev);
++void netdev_set_internal(struct netdev *netdev);
+ bool netdev_has_tunnel_push_pop(const struct netdev *netdev);
+ 
+ /* Open and close. */
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index a332517bc..3151b57b4 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -2034,6 +2034,7 @@ iface_do_create(const struct bridge *br,
+     struct netdev *netdev = NULL;
+     int error;
+     const char *type;
++    const char *iface_type;
+ 
+     if (netdev_is_reserved_name(iface_cfg->name)) {
+         VLOG_WARN("could not create interface %s, name is reserved",
+@@ -2042,14 +2043,17 @@ iface_do_create(const struct bridge *br,
+         goto error;
+     }
+ 
+-    type = ofproto_port_open_type(br->ofproto,
+-                                  iface_get_type(iface_cfg, br->cfg));
++    iface_type = iface_get_type(iface_cfg, br->cfg);
++    type = ofproto_port_open_type(br->ofproto, iface_type);
+     error = netdev_open(iface_cfg->name, type, &netdev);
+     if (error) {
+         VLOG_WARN_BUF(errp, "could not open network device %s (%s)",
+                       iface_cfg->name, ovs_strerror(error));
+         goto error;
+     }
++    if (strcmp(iface_type, "internal") == 0) {
++        netdev_set_internal(netdev);
++    }
+ 
+     error = iface_set_netdev_config(iface_cfg, netdev, errp);
+     if (error) {
+@@ -2142,6 +2146,7 @@ iface_create(struct bridge *br, const struct ovsrec_interface *iface_cfg,
+             error = netdev_open(port->name, "internal", &netdev);
+             if (!error) {
+                 ofp_port_t fake_ofp_port = OFPP_NONE;
++                netdev_set_internal(netdev);
+                 ofproto_port_add(br->ofproto, netdev, &fake_ofp_port);
+                 netdev_close(netdev);
+             } else {
+-- 
+2.17.1
+

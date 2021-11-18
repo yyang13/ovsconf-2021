@@ -1,0 +1,155 @@
+From 13a2df35d52e96b12b3fe79f4d7fe746867cf827 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Tue, 10 Nov 2020 01:29:57 -0500
+Subject: [PATCH 26/47] Fix outer IPv6 issue
+
+Note: make sure outer IPv4 and outer IPv6 can
+work.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.h   | 32 ++++++++++++++++++++++++++++----
+ lib/netdev-dpdk.c | 46 ++++++++++++++++++++++++++++++++++------------
+ 2 files changed, 62 insertions(+), 16 deletions(-)
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 50b61113e..8b4de4eed 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -1017,6 +1017,20 @@ dp_packet_hwol_set_tx_ipv4(struct dp_packet *b)
+     *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_IPV4;
+ }
+ 
++/* Check if packet 'b' is IPv4 checksum offloading. */
++static inline bool
++dp_packet_hwol_is_tx_ipv4(struct dp_packet *b)
++{
++    return (*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_IPV4);
++}
++
++/* Reset packet 'b' for IPv4 checksum offloading. */
++static inline void
++dp_packet_hwol_reset_tx_ipv4(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) &= ~DP_PACKET_OL_TX_IPV4;
++}
++
+ /* Mark packet 'b' for IPv6 checksum offloading. */
+ static inline void
+ dp_packet_hwol_set_tx_ipv6(struct dp_packet *b)
+@@ -1024,6 +1038,20 @@ dp_packet_hwol_set_tx_ipv6(struct dp_packet *b)
+     *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_IPV6;
+ }
+ 
++/* Check if packet 'b' is IPv6 checksum offloading. */
++static inline bool
++dp_packet_hwol_is_tx_ipv6(struct dp_packet *b)
++{
++    return (*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_IPV6);
++}
++
++/* Reset packet 'b' for IPv6 checksum offloading. */
++static inline void
++dp_packet_hwol_reset_tx_ipv6(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) &= ~DP_PACKET_OL_TX_IPV6;
++}
++
+ /* Mark packet 'b' for Outer IPv4 checksum offloading. */
+ static inline void
+ dp_packet_hwol_set_tx_outer_ipv4(struct dp_packet *b)
+@@ -1114,10 +1142,6 @@ static inline void
+ dp_packet_hwol_set_vxlan_tcp_seg(struct dp_packet *b)
+ {
+     b->mbuf.ol_flags |= DP_PACKET_OL_TX_TUNNEL_VXLAN;
+-    b->mbuf.l2_len += sizeof(struct udp_header) +
+-                      sizeof(struct vxlanhdr);
+-    b->mbuf.outer_l2_len = ETH_HEADER_LEN;
+-    b->mbuf.outer_l3_len = IP_HEADER_LEN;
+ }
+ 
+ /* Check if it is a VXLAN packet */
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 83395f19b..8718024d4 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2272,6 +2272,16 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         /* Handle VXLAN TSO */
+         struct rte_udp_hdr *udp_hdr;
+ 
++        /* Correct l2_len for VxLAN packet */
++        mbuf->l2_len += sizeof(struct udp_header)
++                        + sizeof(struct vxlanhdr);
++
++        /* Set outer_l2_len and outer_l3_len */
++        dp_packet_hwol_set_outer_l2_len(pkt, (char *) dp_packet_l3(pkt)
++                                             - (char *) dp_packet_eth(pkt));
++        dp_packet_hwol_set_outer_l3_len(pkt, (char *) dp_packet_l4(pkt)
++                                             - (char *) dp_packet_l3(pkt));
++
+         /* small packets whose size is less than or equal to  MTU needn't
+          * VXLAN TSO. In addtion, if hardware can't support VXLAN TSO, it
+          * also can't be handled. So PKT_TX_TUNNEL_VXLAN must be cleared
+@@ -2285,19 +2295,40 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                         + sizeof(struct vxlanhdr);
+             mbuf->outer_l2_len = 0;
+             mbuf->outer_l3_len = 0;
++            if ((mbuf->ol_flags & PKT_TX_IPV4) &&
++                (mbuf->outer_l3_len == IPV6_HEADER_LEN)) {
++                dp_packet_hwol_reset_tx_ipv4(pkt);
++                dp_packet_hwol_set_tx_ipv6(pkt);
++            } else if ((mbuf->ol_flags & PKT_TX_IPV6) &&
++                (mbuf->outer_l3_len == IP_HEADER_LEN)) {
++                dp_packet_hwol_reset_tx_ipv6(pkt);
++                dp_packet_hwol_set_tx_ipv4(pkt);
++            }
+             return true;
+         }
+ 
+-        if (mbuf->ol_flags & PKT_TX_IPV4) {
++        /* Handle outer packet */
++        if (mbuf->outer_l3_len == IP_HEADER_LEN) {
+             ip_hdr = (struct rte_ipv4_hdr *)((char *) eth_hdr
+                                                   + mbuf->outer_l2_len);
+-            udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
+-
+             /* outer IP checksum offload */
+             ip_hdr->hdr_checksum = 0;
+             mbuf->ol_flags |= PKT_TX_OUTER_IP_CKSUM;
+             mbuf->ol_flags |= PKT_TX_OUTER_IPV4;
+ 
++            udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
++        } else if (mbuf->outer_l3_len == IPV6_HEADER_LEN) {
++            ip6_hdr = (struct rte_ipv6_hdr *)((char *) eth_hdr
++                                                  + mbuf->outer_l2_len);
++            /* no IP checksum for outer IPv6 */
++            mbuf->ol_flags |= PKT_TX_OUTER_IPV6;
++
++            udp_hdr = (struct rte_udp_hdr *)(ip6_hdr + DPDK_RTE_HDR_OFFSET);
++
++        }
++
++        /* Handle inner packet */
++        if (mbuf->ol_flags & PKT_TX_IPV4) {
+             ip_hdr = (struct rte_ipv4_hdr *)
+                 ((uint8_t *)udp_hdr + mbuf->l2_len);
+             l4_proto = ip_hdr->next_proto_id;
+@@ -2307,15 +2338,6 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             ip_hdr->hdr_checksum = 0;
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         } else if (mbuf->ol_flags & PKT_TX_IPV6) {
+-            ip_hdr = (struct rte_ipv4_hdr *)((char *) eth_hdr
+-                                                  + mbuf->outer_l2_len);
+-            udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
+-
+-            /* outer IP checksum offload */
+-            ip_hdr->hdr_checksum = 0;
+-            mbuf->ol_flags |= PKT_TX_OUTER_IP_CKSUM;
+-            mbuf->ol_flags |= PKT_TX_OUTER_IPV4;
+-
+             ip6_hdr = (struct rte_ipv6_hdr *)
+                 ((uint8_t *)udp_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
+-- 
+2.17.1
+

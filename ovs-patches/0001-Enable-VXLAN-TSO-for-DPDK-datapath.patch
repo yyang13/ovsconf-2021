@@ -1,0 +1,583 @@
+From 8b32ac1d537a3b878519ea77ef5c5cc3cf182295 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 5 Aug 2020 05:41:05 -0400
+Subject: [PATCH 01/47] Enable VXLAN TSO for DPDK datapath
+
+Many NICs can support VXLAN TSO which can help
+improve across-compute-node VM-to-VM performance
+in case that MTU is set to 1500.
+
+This patch allows dpdkvhostuserclient interface
+and veth/tap interface to leverage NICs' offload
+capability to maximize across-compute-node TCP
+performance, with it applied, OVS DPDK can reach
+linespeed for across-compute-node VM-to-VM TCP
+performance.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.h       |  76 +++++++++++++++++
+ lib/netdev-dpdk.c     | 188 +++++++++++++++++++++++++++++++++++++++---
+ lib/netdev-linux.c    |  20 +++++
+ lib/netdev-provider.h |   1 +
+ lib/netdev.c          |  69 +++++++++++++++-
+ 5 files changed, 338 insertions(+), 16 deletions(-)
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 0430cca8e..79895f299 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -81,6 +81,8 @@ enum dp_packet_offload_mask {
+     DEF_OL_FLAG(DP_PACKET_OL_TX_UDP_CKSUM, PKT_TX_UDP_CKSUM, 0x400),
+     /* Offload SCTP checksum. */
+     DEF_OL_FLAG(DP_PACKET_OL_TX_SCTP_CKSUM, PKT_TX_SCTP_CKSUM, 0x800),
++    /* VXLAN TCP Segmentation Offload. */
++    DEF_OL_FLAG(DP_PACKET_OL_TX_TUNNEL_VXLAN, PKT_TX_TUNNEL_VXLAN, 0x1000),
+     /* Adding new field requires adding to DP_PACKET_OL_SUPPORTED_MASK. */
+ };
+ 
+@@ -1032,6 +1034,80 @@ dp_packet_hwol_set_tcp_seg(struct dp_packet *b)
+     *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_TCP_SEG;
+ }
+ 
++#ifdef DPDK_NETDEV
++/* Mark packet 'b' for VXLAN TCP segmentation offloading. */
++static inline void
++dp_packet_hwol_set_vxlan_tcp_seg(struct dp_packet *b)
++{
++    b->mbuf.ol_flags |= DP_PACKET_OL_TX_TUNNEL_VXLAN;
++    b->mbuf.l2_len += sizeof(struct udp_header) +
++                      sizeof(struct vxlanhdr);
++    b->mbuf.outer_l2_len = ETH_HEADER_LEN;
++    b->mbuf.outer_l3_len = IP_HEADER_LEN;
++}
++
++/* Check if it is a VXLAN packet */
++static inline bool
++dp_packet_hwol_is_vxlan_tcp_seg(struct dp_packet *b)
++{
++    return (b->mbuf.ol_flags & DP_PACKET_OL_TX_TUNNEL_VXLAN);
++}
++
++/* Set l2_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l2_len(struct dp_packet *b, int l2_len)
++{
++    b->mbuf.l2_len = l2_len;
++}
++
++/* Set l3_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l3_len(struct dp_packet *b, int l3_len)
++{
++    b->mbuf.l3_len = l3_len;
++}
++
++/* Set l4_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l4_len(struct dp_packet *b, int l4_len)
++{
++    b->mbuf.l4_len = l4_len;
++}
++#else
++/* Mark packet 'b' for VXLAN TCP segmentation offloading. */
++static inline void
++dp_packet_hwol_set_vxlan_tcp_seg(struct dp_packet *b OVS_UNUSED)
++{
++}
++
++/* Check if it is a VXLAN packet */
++static inline bool
++dp_packet_hwol_is_vxlan_tcp_seg(struct dp_packet *b OVS_UNUSED)
++{
++}
++
++/* Set l2_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l2_len(struct dp_packet *b OVS_UNUSED,
++                          int l2_len OVS_UNUSED)
++{
++}
++
++/* Set l3_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l3_len(struct dp_packet *b OVS_UNUSED,
++                          int l3_len OVS_UNUSED)
++{
++}
++
++/* Set l4_len for the packet 'b' */
++static inline void
++dp_packet_hwol_set_l4_len(struct dp_packet *b OVS_UNUSED,
++                          int l4_len OVS_UNUSED)
++{
++}
++#endif /* DPDK_NETDEV */
++
+ static inline bool
+ dp_packet_ip_checksum_valid(const struct dp_packet *p)
+ {
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index c2ec93c91..982e7c48b 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -44,6 +44,7 @@
+ #include <rte_pci.h>
+ #include <rte_version.h>
+ #include <rte_vhost.h>
++#include <rte_ip.h>
+ 
+ #include "cmap.h"
+ #include "coverage.h"
+@@ -87,6 +88,7 @@ COVERAGE_DEFINE(vhost_notification);
+ 
+ #define OVS_CACHE_LINE_SIZE CACHE_LINE_SIZE
+ #define OVS_VPORT_DPDK "ovs_dpdk"
++#define DPDK_RTE_HDR_OFFSET 1
+ 
+ /*
+  * need to reserve tons of extra space in the mbufs so we can align the
+@@ -404,6 +406,7 @@ enum dpdk_hw_ol_features {
+     NETDEV_RX_HW_SCATTER = 1 << 2,
+     NETDEV_TX_TSO_OFFLOAD = 1 << 3,
+     NETDEV_TX_SCTP_CHECKSUM_OFFLOAD = 1 << 4,
++    NETDEV_TX_VXLAN_TNL_TSO_OFFLOAD = 1 << 5,
+ };
+ 
+ /*
+@@ -993,8 +996,17 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
+         conf.rxmode.offloads |= DEV_RX_OFFLOAD_KEEP_CRC;
+     }
+ 
++    if (info.rx_offload_capa & DEV_TX_OFFLOAD_MULTI_SEGS) {
++        conf.txmode.offloads |= DEV_TX_OFFLOAD_MULTI_SEGS;
++    }
++
+     if (dev->hw_ol_features & NETDEV_TX_TSO_OFFLOAD) {
+         conf.txmode.offloads |= DPDK_TX_TSO_OFFLOAD_FLAGS;
++        /* Enable VXLAN TSO support if available */
++        if (dev->hw_ol_features & NETDEV_TX_VXLAN_TNL_TSO_OFFLOAD) {
++            conf.txmode.offloads |= DEV_TX_OFFLOAD_VXLAN_TNL_TSO;
++            conf.txmode.offloads |= DEV_TX_OFFLOAD_OUTER_IPV4_CKSUM;
++        }
+         if (dev->hw_ol_features & NETDEV_TX_SCTP_CHECKSUM_OFFLOAD) {
+             conf.txmode.offloads |= DEV_TX_OFFLOAD_SCTP_CKSUM;
+         }
+@@ -1133,6 +1145,10 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
+         if ((info.tx_offload_capa & tx_tso_offload_capa)
+             == tx_tso_offload_capa) {
+             dev->hw_ol_features |= NETDEV_TX_TSO_OFFLOAD;
++            /* Enable VXLAN TSO support if available */
++            if (info.tx_offload_capa & DEV_TX_OFFLOAD_VXLAN_TNL_TSO) {
++                dev->hw_ol_features |= NETDEV_TX_VXLAN_TNL_TSO_OFFLOAD;
++            }
+             if (info.tx_offload_capa & DEV_TX_OFFLOAD_SCTP_CKSUM) {
+                 dev->hw_ol_features |= NETDEV_TX_SCTP_CHECKSUM_OFFLOAD;
+             } else {
+@@ -2138,35 +2154,166 @@ netdev_dpdk_rxq_dealloc(struct netdev_rxq *rxq)
+     rte_free(rx);
+ }
+ 
++static inline bool
++is_local_to_local(uint16_t src_port_id, struct netdev_dpdk *dev)
++{
++    bool ret = false;
++    struct netdev_dpdk *src_dev;
++
++    if (src_port_id == UINT16_MAX) {
++        ret = true;
++    } else {
++        src_dev = netdev_dpdk_lookup_by_port_id(src_port_id);
++        if (src_dev && (netdev_dpdk_get_vid(src_dev) >= 0)) {
++            ret = true;
++        }
++    }
++
++    if (ret) {
++        if (netdev_dpdk_get_vid(dev) < 0) {
++            ret = false;
++        }
++    }
++
++    return ret;
++}
++
+ /* Prepare the packet for HWOL.
+  * Return True if the packet is OK to continue. */
+ static bool
+ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ {
+     struct dp_packet *pkt = CONTAINER_OF(mbuf, struct dp_packet, mbuf);
++    uint16_t l4_proto = 0;
++    uint8_t *l3_hdr_ptr = NULL;
++    struct rte_ether_hdr *eth_hdr =
++        rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
++    struct rte_ipv4_hdr *ip_hdr;
++    struct rte_ipv6_hdr *ip6_hdr;
++
++    /* Return directly if source and destitation of mbuf are local ports
++     * because mbuf has already set ol_flags and l*_len correctly.
++     */
++    if (is_local_to_local(mbuf->port, dev)) {
++        if (mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)) {
++            mbuf->tso_segsz = 1450 - mbuf->l3_len - mbuf->l4_len;
++        }
++        return true;
++    }
++
++    if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
++        /* Handle VXLAN TSO */
++        struct rte_udp_hdr *udp_hdr;
++
++        /* small packets whose size is less than or equal to  MTU needn't
++         * VXLAN TSO. In addtion, if hardware can't support VXLAN TSO, it
++         * also can't be handled. So PKT_TX_TUNNEL_VXLAN must be cleared
++         * outer_l2_len and outer_l3_len must be zeroed.
++         */
++        if (!(dev->up.ol_flags & NETDEV_TX_OFFLOAD_VXLAN_TSO)
++            || (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG))
++            && (mbuf->pkt_len <= 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
++                + mbuf->l2_len)))  {
++            mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
++            mbuf->l2_len -= sizeof(struct udp_header)
++                        + sizeof(struct vxlanhdr);
++            mbuf->outer_l2_len = 0;
++            mbuf->outer_l3_len = 0;
++            return true;
++        }
++
++        if (mbuf->ol_flags & PKT_TX_IPV4) {
++            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
++
++            /* outer IP checksum offload */
++            ip_hdr->hdr_checksum = 0;
++            mbuf->ol_flags |= PKT_TX_OUTER_IP_CKSUM;
++            mbuf->ol_flags |= PKT_TX_OUTER_IPV4;
++
++            ip_hdr = (struct rte_ipv4_hdr *)
++                ((uint8_t *)udp_hdr + mbuf->l2_len);
++            l4_proto = ip_hdr->next_proto_id;
++            l3_hdr_ptr = (uint8_t *)ip_hdr;
++
++            /* inner IP checksum offload */
++            ip_hdr->hdr_checksum = 0;
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        } else if (mbuf->ol_flags & PKT_TX_IPV6) {
++            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
++
++            /* outer IP checksum offload */
++            ip_hdr->hdr_checksum = 0;
++            mbuf->ol_flags |= PKT_TX_OUTER_IP_CKSUM;
++            mbuf->ol_flags |= PKT_TX_OUTER_IPV4;
++
++            ip6_hdr = (struct rte_ipv6_hdr *)
++                ((uint8_t *)udp_hdr + mbuf->l2_len);
++            l4_proto = ip6_hdr->proto;
++            l3_hdr_ptr = (uint8_t *)ip6_hdr;
++
++            /* inner IP checksum offload offload */
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        }
++    } else if (mbuf->ol_flags & PKT_TX_L4_MASK) {
++        /* Handle VLAN TSO */
++            /* no inner IP checksum for IPV6 */
++        if (mbuf->ol_flags & PKT_TX_IPV4) {
++            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            l4_proto = ip_hdr->next_proto_id;
++            l3_hdr_ptr = (uint8_t *)ip_hdr;
++
++            /* IP checksum offload */
++            ip_hdr->hdr_checksum = 0;
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        } else if (mbuf->ol_flags & PKT_TX_IPV6) {
++            ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            l4_proto = ip6_hdr->proto;
++            l3_hdr_ptr = (uint8_t *)ip6_hdr;
++
++            /* IP checksum offload */
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        }
+ 
+-    if (mbuf->ol_flags & PKT_TX_L4_MASK) {
+         mbuf->l2_len = (char *)dp_packet_l3(pkt) - (char *)dp_packet_eth(pkt);
+         mbuf->l3_len = (char *)dp_packet_l4(pkt) - (char *)dp_packet_l3(pkt);
+         mbuf->outer_l2_len = 0;
+         mbuf->outer_l3_len = 0;
+     }
+ 
+-    if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
+-        struct tcp_header *th = dp_packet_l4(pkt);
++    /* It is possible that l4_len isn't set for vhostuserclient */
++    if ((l3_hdr_ptr != NULL) && (l4_proto == IPPROTO_TCP)
++        && (mbuf->l4_len < 20)) {
++        struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)
++            (l3_hdr_ptr + mbuf->l3_len);
+ 
+-        if (!th) {
++        mbuf->l4_len = (tcp_hdr->data_off & 0xf0) >> 2;
++    }
++
++    if ((mbuf->ol_flags & PKT_TX_L4_MASK) == PKT_TX_UDP_CKSUM) {
++        if (l4_proto != IPPROTO_UDP) {
++            VLOG_WARN_RL(&rl, "%s: UDP packet without L4 header"
++                         " pkt len: %"PRIu32"", dev->up.name, mbuf->pkt_len);
++            return false;
++        }
++    } else if (mbuf->ol_flags & PKT_TX_TCP_SEG ||
++               mbuf->ol_flags & PKT_TX_TCP_CKSUM) {
++        if (l4_proto != IPPROTO_TCP) {
+             VLOG_WARN_RL(&rl, "%s: TCP Segmentation without L4 header"
+                          " pkt len: %"PRIu32"", dev->up.name, mbuf->pkt_len);
+             return false;
+         }
+ 
+-        mbuf->l4_len = TCP_OFFSET(th->tcp_ctl) * 4;
+-        mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
+-        mbuf->tso_segsz = dev->mtu - mbuf->l3_len - mbuf->l4_len;
++        if (mbuf->pkt_len - mbuf->l2_len > 1450) {
++            dp_packet_hwol_set_tcp_seg(pkt);
++        }
+ 
+-        if (mbuf->ol_flags & PKT_TX_IPV4) {
+-            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
++        if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
++            mbuf->tso_segsz = 1450 - mbuf->l3_len - mbuf->l4_len;
++        } else {
++            mbuf->tso_segsz = 0;
+         }
+     }
+     return true;
+@@ -2744,19 +2891,27 @@ dpdk_copy_dp_packet_to_mbuf(struct rte_mempool *mp, struct dp_packet *pkt_orig)
+ 
+     mbuf_dest->tx_offload = pkt_orig->mbuf.tx_offload;
+     mbuf_dest->packet_type = pkt_orig->mbuf.packet_type;
+-    mbuf_dest->ol_flags |= (pkt_orig->mbuf.ol_flags &
+-                            ~(EXT_ATTACHED_MBUF | IND_ATTACHED_MBUF));
++    mbuf_dest->ol_flags |= pkt_orig->mbuf.ol_flags;
++    mbuf_dest->l2_len = pkt_orig->mbuf.l2_len;
++    mbuf_dest->l3_len = pkt_orig->mbuf.l3_len;
++    mbuf_dest->l4_len = pkt_orig->mbuf.l4_len;
++    mbuf_dest->outer_l2_len = pkt_orig->mbuf.outer_l2_len;
++    mbuf_dest->outer_l3_len = pkt_orig->mbuf.outer_l3_len;
+ 
+     memcpy(&pkt_dest->l2_pad_size, &pkt_orig->l2_pad_size,
+            sizeof(struct dp_packet) - offsetof(struct dp_packet, l2_pad_size));
+ 
+-    if (mbuf_dest->ol_flags & PKT_TX_L4_MASK) {
++    if ((mbuf_dest->outer_l2_len == 0) &&
++        (mbuf_dest->ol_flags & PKT_TX_L4_MASK)) {
+         mbuf_dest->l2_len = (char *)dp_packet_l3(pkt_dest)
+                                 - (char *)dp_packet_eth(pkt_dest);
+         mbuf_dest->l3_len = (char *)dp_packet_l4(pkt_dest)
+                                 - (char *) dp_packet_l3(pkt_dest);
+     }
+ 
++    /* Mark it as non-DPDK port */
++    mbuf_dest->port = UINT16_MAX;
++
+     return pkt_dest;
+ }
+ 
+@@ -2815,6 +2970,11 @@ dpdk_do_tx_copy(struct netdev *netdev, int qid, struct dp_packet_batch *batch)
+         if (dev->type == DPDK_DEV_VHOST) {
+             __netdev_dpdk_vhost_send(netdev, qid, pkts, txcnt);
+         } else {
++            if (userspace_tso_enabled()) {
++                txcnt = netdev_dpdk_prep_hwol_batch(dev,
++                                                    (struct rte_mbuf **)pkts,
++                                                    txcnt);
++            }
+             tx_failure += netdev_dpdk_eth_tx_burst(dev, qid,
+                                                    (struct rte_mbuf **)pkts,
+                                                    txcnt);
+@@ -4956,6 +5116,10 @@ netdev_dpdk_reconfigure(struct netdev *netdev)
+         netdev->ol_flags |= NETDEV_TX_OFFLOAD_TCP_CKSUM;
+         netdev->ol_flags |= NETDEV_TX_OFFLOAD_UDP_CKSUM;
+         netdev->ol_flags |= NETDEV_TX_OFFLOAD_IPV4_CKSUM;
++        /* Enable VXLAN TSO support if available */
++        if (dev->hw_ol_features & NETDEV_TX_VXLAN_TNL_TSO_OFFLOAD) {
++            netdev->ol_flags |= NETDEV_TX_OFFLOAD_VXLAN_TSO;
++        }
+         if (dev->hw_ol_features & NETDEV_TX_SCTP_CHECKSUM_OFFLOAD) {
+             netdev->ol_flags |= NETDEV_TX_OFFLOAD_SCTP_CKSUM;
+         }
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index fe7fb9b29..9f830b4c4 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -6508,6 +6508,8 @@ netdev_linux_parse_l2(struct dp_packet *b, uint16_t *l4proto)
+     struct eth_header *eth_hdr;
+     ovs_be16 eth_type;
+     int l2_len;
++    int l3_len = 0;
++    int l4_len = 0;
+ 
+     eth_hdr = dp_packet_at(b, 0, ETH_HEADER_LEN);
+     if (!eth_hdr) {
+@@ -6527,6 +6529,8 @@ netdev_linux_parse_l2(struct dp_packet *b, uint16_t *l4proto)
+         l2_len += VLAN_HEADER_LEN;
+     }
+ 
++    dp_packet_hwol_set_l2_len(b, l2_len);
++
+     if (eth_type == htons(ETH_TYPE_IP)) {
+         struct ip_header *ip_hdr = dp_packet_at(b, l2_len, IP_HEADER_LEN);
+ 
+@@ -6534,6 +6538,7 @@ netdev_linux_parse_l2(struct dp_packet *b, uint16_t *l4proto)
+             return -EINVAL;
+         }
+ 
++        l3_len = IP_HEADER_LEN;
+         *l4proto = ip_hdr->ip_proto;
+         dp_packet_hwol_set_tx_ipv4(b);
+     } else if (eth_type == htons(ETH_TYPE_IPV6)) {
+@@ -6544,10 +6549,25 @@ netdev_linux_parse_l2(struct dp_packet *b, uint16_t *l4proto)
+             return -EINVAL;
+         }
+ 
++        l3_len = IPV6_HEADER_LEN;
+         *l4proto = nh6->ip6_ctlun.ip6_un1.ip6_un1_nxt;
+         dp_packet_hwol_set_tx_ipv6(b);
+     }
+ 
++    dp_packet_hwol_set_l3_len(b, l3_len);
++
++    if (*l4proto == IPPROTO_TCP) {
++        struct tcp_header *tcp_hdr =  dp_packet_at(b, l2_len + l3_len,
++                                          sizeof(struct tcp_header));
++
++        if (!tcp_hdr) {
++            return -EINVAL;
++        }
++
++        l4_len = TCP_OFFSET(tcp_hdr->tcp_ctl) * 4;
++        dp_packet_hwol_set_l4_len(b, l4_len);
++    }
++
+     return 0;
+ }
+ 
+diff --git a/lib/netdev-provider.h b/lib/netdev-provider.h
+index 73dce2fca..d616d791e 100644
+--- a/lib/netdev-provider.h
++++ b/lib/netdev-provider.h
+@@ -43,6 +43,7 @@ enum netdev_ol_flags {
+     NETDEV_TX_OFFLOAD_UDP_CKSUM = 1 << 2,
+     NETDEV_TX_OFFLOAD_SCTP_CKSUM = 1 << 3,
+     NETDEV_TX_OFFLOAD_TCP_TSO = 1 << 4,
++    NETDEV_TX_OFFLOAD_VXLAN_TSO = 1 << 5,
+ };
+ 
+ /* A network device (e.g. an Ethernet device).
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 91e91955c..64583d1c3 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -33,6 +33,7 @@
+ 
+ #include "cmap.h"
+ #include "coverage.h"
++#include "csum.h"
+ #include "dpif.h"
+ #include "dp-packet.h"
+ #include "openvswitch/dynamic-string.h"
+@@ -785,6 +786,36 @@ netdev_get_pt_mode(const struct netdev *netdev)
+             : NETDEV_PT_LEGACY_L2);
+ }
+ 
++static inline void
++calculate_tcpudp_checksum(struct dp_packet *p)
++{
++    uint32_t pseudo_hdr_csum;
++    struct ip_header *ip = dp_packet_l3(p);
++    size_t l4_len = (char *) dp_packet_tail(p) - (char *) dp_packet_l4(p);
++    uint16_t l4_proto = 0;
++
++    l4_proto = ip->ip_proto;
++    ip->ip_csum = 0;
++    ip->ip_csum = csum(ip, sizeof *ip);
++    pseudo_hdr_csum = packet_csum_pseudoheader(ip);
++    if (l4_proto == IPPROTO_TCP) {
++        struct tcp_header *tcp = dp_packet_l4(p);
++
++        tcp->tcp_csum = 0;
++        tcp->tcp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
++                                                  tcp, l4_len));
++    } else if (l4_proto == IPPROTO_UDP) {
++        struct udp_header *udp = dp_packet_l4(p);
++
++        udp->udp_csum = 0;
++        udp->udp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
++                                                  udp, l4_len));
++        if (!udp->udp_csum) {
++            udp->udp_csum = htons(0xffff);
++        }
++    }
++}
++
+ /* Check if a 'packet' is compatible with 'netdev_flags'.
+  * If a packet is incompatible, return 'false' with the 'errormsg'
+  * pointing to a reason. */
+@@ -794,6 +825,14 @@ netdev_send_prepare_packet(const uint64_t netdev_flags,
+ {
+     uint64_t l4_mask;
+ 
++    if (dp_packet_hwol_is_vxlan_tcp_seg(packet)
++        && (dp_packet_hwol_is_tso(packet) || dp_packet_hwol_l4_mask(packet))
++        && !(netdev_flags & NETDEV_TX_OFFLOAD_VXLAN_TSO)) {
++        /* Fall back to GSO in software. */
++        VLOG_ERR_BUF(errormsg, "No VXLAN TSO support");
++        return false;
++    }
++
+     if (dp_packet_hwol_is_tso(packet)
+         && !(netdev_flags & NETDEV_TX_OFFLOAD_TCP_TSO)) {
+             /* Fall back to GSO in software. */
+@@ -960,15 +999,37 @@ netdev_push_header(const struct netdev *netdev,
+     size_t i, size = dp_packet_batch_size(batch);
+ 
+     DP_PACKET_BATCH_REFILL_FOR_EACH (i, size, packet, batch) {
+-        if (OVS_UNLIKELY(dp_packet_hwol_is_tso(packet)
+-                         || dp_packet_hwol_l4_mask(packet))) {
++        if (OVS_UNLIKELY((dp_packet_hwol_is_tso(packet)
++                          || dp_packet_hwol_l4_mask(packet))
++                         && (data->tnl_type != OVS_VPORT_TYPE_VXLAN))) {
+             COVERAGE_INC(netdev_push_header_drops);
+             dp_packet_delete(packet);
+-            VLOG_WARN_RL(&rl, "%s: Tunneling packets with HW offload flags is "
+-                         "not supported: packet dropped",
++            VLOG_WARN_RL(&rl,
++                         "%s: non-VxLAN Tunneling packets with HW offload "
++                         "flags is not supported: packet dropped",
+                          netdev_get_name(netdev));
+         } else {
++            if (data->tnl_type == OVS_VPORT_TYPE_VXLAN) {
++                /* VXLAN offload can't support udp checksum offload
++                 * for inner udp packet, so udp checksum must be set
++                 * before push header in order that outer checksum can
++                 * be set correctly.
++                 */
++                if (dp_packet_hwol_l4_is_udp(packet)) {
++                    packet->mbuf.ol_flags &= ~DP_PACKET_OL_TX_UDP_CKSUM;
++                    calculate_tcpudp_checksum(packet);
++                }
++            }
+             netdev->netdev_class->push_header(netdev, packet, data);
++            if (data->tnl_type == OVS_VPORT_TYPE_VXLAN) {
++                /* Just identify it as a vxlan packet, here netdev is
++                 * vxlan_sys_*, netdev->ol_flags can't indicate if final
++                 * physical output port can support VXLAN TSO, in
++                 * netdev_send_prepare_packet will drop it if final
++                 * physical output port can't support VXLAN TSO.
++                 */
++                dp_packet_hwol_set_vxlan_tcp_seg(packet);
++            }
+             pkt_metadata_init(&packet->md, data->out_port);
+             dp_packet_batch_refill(batch, packet, i);
+         }
+-- 
+2.17.1
+

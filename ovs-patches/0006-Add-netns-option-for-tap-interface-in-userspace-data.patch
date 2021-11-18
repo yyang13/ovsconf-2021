@@ -1,0 +1,106 @@
+From 5b25edbb2a5812dfedbe451bb8cc484a682b7e67 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 9 Sep 2020 21:27:44 -0500
+Subject: [PATCH 06/47] Add netns option for tap interface in userspace
+ datapath
+
+In userspace datapath, "ovs-vsctl list interface" can't
+get interface statistics and there are many WARN log, we
+can enable it work normally if it has correct network
+namespace. This patch enabled netns option for tap interface
+, it is the prerequisite interface statistics and other
+ioctl can work normally.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-linux-private.h |  1 +
+ lib/netdev-linux.c         | 47 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/lib/netdev-linux-private.h b/lib/netdev-linux-private.h
+index c7c515f70..fbedfd96a 100644
+--- a/lib/netdev-linux-private.h
++++ b/lib/netdev-linux-private.h
+@@ -68,6 +68,7 @@ struct netdev_linux {
+     struct timer miimon_timer;
+ 
+     int netnsid;                    /* Network namespace ID. */
++    char *netns;                    /* Network namespace name. */
+     /* The following are figured out "on demand" only.  They are only valid
+      * when the corresponding VALID_* bit in 'cache_valid' is set. */
+     int ifindex;
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 25effc565..f84b91b4e 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1055,6 +1055,9 @@ netdev_linux_destruct(struct netdev *netdev_)
+     {
+         ioctl(netdev->tap_fd, TUNSETPERSIST, 0);
+         close(netdev->tap_fd);
++        if (netdev->netns != NULL) {
++            free(netdev->netns);
++        }
+     }
+ 
+     if (netdev->miimon_interval > 0) {
+@@ -3533,6 +3536,48 @@ exit:
+     return error;
+ }
+ 
++static int
++netdev_tap_set_config(struct netdev *netdev, const struct smap *args,
++                        char **errp OVS_UNUSED)
++{
++    struct netdev_linux *dev = netdev_linux_cast(netdev);
++    const char *netns;
++
++    ovs_mutex_lock(&dev->mutex);
++    netns = smap_get(args, "netns");
++    if (netns != NULL) {
++        char nspath[128];
++        int nsfd;
++
++        sprintf(nspath, "/var/run/netns/%s", netns);
++        nsfd = open(nspath, O_RDONLY);
++        if (nsfd < 0) {
++            ovs_mutex_unlock(&dev->mutex);
++            VLOG_ERR("%s: netns %s doesn't exist.",
++                         netdev_get_name(netdev), netns);
++            return EINVAL;
++        }
++        close(nsfd);
++    }
++
++    if (netns != NULL) {
++        dev->netns = xstrdup(netns);
++    }
++    ovs_mutex_unlock(&dev->mutex);
++    return 0;
++}
++
++static int
++netdev_tap_get_config(const struct netdev *netdev, struct smap *args)
++{
++    struct netdev_linux *dev = netdev_linux_cast(netdev);
++
++    ovs_mutex_lock(&dev->mutex);
++    smap_add_format(args, "netns", "%s", dev->netns);
++    ovs_mutex_unlock(&dev->mutex);
++    return 0;
++}
++
+ #define NETDEV_LINUX_CLASS_COMMON                               \
+     .run = netdev_linux_run,                                    \
+     .wait = netdev_linux_wait,                                  \
+@@ -3597,6 +3642,8 @@ const struct netdev_class netdev_tap_class = {
+     .get_stats = netdev_tap_get_stats,
+     .get_features = netdev_linux_get_features,
+     .get_status = netdev_linux_get_status,
++    .set_config = netdev_tap_set_config,
++    .get_config = netdev_tap_get_config,
+     .send = netdev_linux_send,
+     .rxq_construct = netdev_linux_rxq_construct,
+     .rxq_destruct = netdev_linux_rxq_destruct,
+-- 
+2.17.1
+

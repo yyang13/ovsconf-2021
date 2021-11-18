@@ -1,0 +1,33 @@
+From b87fe8fdaaf899f3d86b3c7b3aff7cbc36b10209 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Fri, 30 Apr 2021 04:53:19 -0400
+Subject: [PATCH 47/47] Fix build error for non-dpdk case
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-linux.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 1b07c8f8a..8ca9c0ce8 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1999,6 +1999,7 @@ netdev_linux_tap_batch_send(struct netdev *netdev_, bool tso, int mtu,
+         ssize_t retval;
+         int error;
+ 
++#ifdef DPDK_NETDEV
+         /* It is a GROed packet which has multiple segments, so need to merge
+          * as a big packet in order that sendmmsg can handle it correctly.
+          */
+@@ -2022,6 +2023,7 @@ netdev_linux_tap_batch_send(struct netdev *netdev_, bool tso, int mtu,
+             batch->packets[i] = new_packet;
+             packet = new_packet;
+         }
++#endif
+         if (tso) {
+             netdev_linux_prepend_vnet_hdr(packet, mtu);
+         }
+-- 
+2.17.1
+

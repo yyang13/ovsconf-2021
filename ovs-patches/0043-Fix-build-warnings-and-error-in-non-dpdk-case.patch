@@ -1,0 +1,65 @@
+From 4dcae5d7b2c0c9504c08addd1b51562528baf9cc Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 25 Jan 2021 20:58:19 -0500
+Subject: [PATCH 43/47] Fix build warnings and error in non-dpdk case
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.h    | 8 +++++---
+ lib/netdev-linux.c | 2 ++
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 8b4cb9388..9487c7610 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -1255,13 +1255,15 @@ dp_packet_hwol_set_l4_len(struct dp_packet *b OVS_UNUSED,
+ 
+ /* Set outer_l2_len for the packet 'b' */
+ static inline void
+-dp_packet_hwol_set_outer_l2_len(struct dp_packet *b, int outer_l2_len)
++dp_packet_hwol_set_outer_l2_len(struct dp_packet *b OVS_UNUSED,
++                                int outer_l2_len OVS_UNUSED)
+ {
+ }
+ 
+ /* Set outer_l3_len for the packet 'b' */
+ static inline void
+-dp_packet_hwol_set_outer_l3_len(struct dp_packet *b, int outer_l3_len)
++dp_packet_hwol_set_outer_l3_len(struct dp_packet *b OVS_UNUSED,
++                                int outer_l3_len OVS_UNUSED)
+ {
+ }
+ 
+@@ -1302,7 +1304,7 @@ dp_packet_hwol_get_outer_l3_len(struct dp_packet *b)
+ 
+ /* Check if packet 'b' is multisegmented */
+ static inline bool
+-dp_packet_hwol_is_multiseg(struct dp_packet *b)
++dp_packet_hwol_is_multiseg(struct dp_packet *b OVS_UNUSED)
+ {
+     return false;
+ }
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index f270464be..92b32818a 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1679,6 +1679,7 @@ netdev_linux_sock_batch_send(int sock, int ifindex, bool tso, int mtu,
+ 
+     struct dp_packet *packet;
+     DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
++#ifdef DPDK_NETDEV
+         /* It is a GROed packet which has multiple segments, so need to merge
+          * as a big packet in order that sendmmsg can handle it correctly.
+          */
+@@ -1702,6 +1703,7 @@ netdev_linux_sock_batch_send(int sock, int ifindex, bool tso, int mtu,
+             batch->packets[i] = new_packet;
+             packet = new_packet;
+         }
++#endif
+         if (tso) {
+             netdev_linux_prepend_vnet_hdr(packet, mtu);
+         }
+-- 
+2.17.1
+

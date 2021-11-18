@@ -1,0 +1,71 @@
+From 74a975bc5d65043237ee13406426a7b7e56662d5 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 11 Nov 2020 21:16:30 -0500
+Subject: [PATCH 27/47] Fix udp issue for outer IPv6
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 8718024d4..54482f4f1 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2291,10 +2291,6 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             && (mbuf->pkt_len <= tso_segsz + mbuf->outer_l2_len
+                                      + mbuf->outer_l3_len + mbuf->l2_len))  {
+             mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+-            mbuf->l2_len -= sizeof(struct udp_header)
+-                        + sizeof(struct vxlanhdr);
+-            mbuf->outer_l2_len = 0;
+-            mbuf->outer_l3_len = 0;
+             if ((mbuf->ol_flags & PKT_TX_IPV4) &&
+                 (mbuf->outer_l3_len == IPV6_HEADER_LEN)) {
+                 dp_packet_hwol_reset_tx_ipv4(pkt);
+@@ -2304,6 +2300,11 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                 dp_packet_hwol_reset_tx_ipv6(pkt);
+                 dp_packet_hwol_set_tx_ipv4(pkt);
+             }
++            mbuf->l2_len = mbuf->outer_l2_len;
++            mbuf->l3_len = mbuf->outer_l3_len;
++            mbuf->l4_len = sizeof(struct rte_udp_hdr);
++            mbuf->outer_l2_len = 0;
++            mbuf->outer_l3_len = 0;
+             return true;
+         }
+ 
+@@ -2448,11 +2449,26 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                 /* Pretend it as a normal UDP and stop inner cksum offload */
+                 mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+                 mbuf->ol_flags &= ~PKT_TX_OUTER_IP_CKSUM;
+-                mbuf->ol_flags &= ~PKT_TX_OUTER_IPV4;
+-                if (mbuf->ol_flags & PKT_TX_IPV6) {
+-                    mbuf->ol_flags &= ~PKT_TX_IPV6;
+-                    mbuf->ol_flags |= PKT_TX_IPV4;
++                if (mbuf->ol_flags & PKT_TX_OUTER_IPV4) {
++                    mbuf->ol_flags &= ~PKT_TX_OUTER_IPV4;
++                    if (mbuf->ol_flags & PKT_TX_IPV6) {
++                        mbuf->ol_flags &= ~PKT_TX_IPV6;
++                    }
++                    if ((mbuf->ol_flags & PKT_TX_IPV4) == 0) {
++                        mbuf->ol_flags |= PKT_TX_IPV4;
++                    }
+                     mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++                } else if (mbuf->ol_flags & PKT_TX_OUTER_IPV6) {
++                    mbuf->ol_flags &= ~PKT_TX_OUTER_IPV6;
++                    if (mbuf->ol_flags & PKT_TX_IPV4) {
++                        mbuf->ol_flags &= ~PKT_TX_IPV4;
++                        mbuf->ol_flags &= ~PKT_TX_IP_CKSUM;
++                    }
++                    if ((mbuf->ol_flags & PKT_TX_IPV6) == 0) {
++                        mbuf->ol_flags |= PKT_TX_IPV6;
++                    }
++                    /* For outer IPv6, outer udp checksum is incorrect */
++                    mbuf->ol_flags |= PKT_TX_UDP_CKSUM;
+                 }
+                 mbuf->l2_len = mbuf->outer_l2_len;
+                 mbuf->l3_len = mbuf->outer_l3_len;
+-- 
+2.17.1
+

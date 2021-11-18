@@ -1,0 +1,289 @@
+From 53a7cf1a46aa8949ad3c96cbb7ba1939372bc5c1 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 20 Sep 2020 22:01:30 -0400
+Subject: [PATCH 16/47] Fix l2 length issue on pushing and popping vlan
+
+In openstack environment, ovs may push or pop vlan tag
+, but l2 lenght isn't recalculated, so outer_l2_len and
+l2_len can't reflect correct l2 length, offload hardware
+can't work normally.
+
+This commit fixed the issue and make sure l2 length is
+recalculated on calling dp_packet_resize_l2.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.c    |  9 +++++++
+ lib/dp-packet.h    | 58 ++++++++++++++++++++++++++++++++++++++++++++++
+ lib/netdev-dpdk.c  | 21 +++++++++--------
+ lib/netdev-linux.c | 30 ++++++++++++++++++++----
+ lib/netdev.c       | 22 ++++++++++++++++++
+ 5 files changed, 125 insertions(+), 15 deletions(-)
+
+diff --git a/lib/dp-packet.c b/lib/dp-packet.c
+index 72f6d09ac..ee0ccee88 100644
+--- a/lib/dp-packet.c
++++ b/lib/dp-packet.c
+@@ -502,7 +502,16 @@ dp_packet_resize_l2_5(struct dp_packet *b, int increment)
+ void *
+ dp_packet_resize_l2(struct dp_packet *b, int increment)
+ {
++    int outer_l2_len = dp_packet_hwol_get_outer_l2_len(b);
++
+     dp_packet_resize_l2_5(b, increment);
+     dp_packet_adjust_layer_offset(&b->l2_5_ofs, increment);
++    if (outer_l2_len) {
++        dp_packet_hwol_set_outer_l2_len(b, outer_l2_len + increment);
++    } else {
++        int l2_len = dp_packet_hwol_get_l2_len(b);
++
++        dp_packet_hwol_set_l2_len(b, l2_len + increment);
++    }
+     return dp_packet_data(b);
+ }
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 18307c02c..6ad0b7e29 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -1115,6 +1115,36 @@ dp_packet_hwol_set_outer_l3_len(struct dp_packet *b, int outer_l3_len)
+ {
+     b->mbuf.outer_l3_len = outer_l3_len;
+ }
++
++/* Get l2_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_l2_len(struct dp_packet *b)
++{
++    return b->mbuf.l2_len;
++}
++
++/* Get l3_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_l3_len(struct dp_packet *b)
++{
++    return b->mbuf.l3_len;
++}
++
++/* Get outer_l2_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_outer_l2_len(struct dp_packet *b)
++{
++    return b->mbuf.outer_l2_len;
++}
++
++
++/* Get outer_l3_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_outer_l3_len(struct dp_packet *b)
++{
++    return b->mbuf.outer_l3_len;
++}
++
+ #else
+ /* Mark packet 'b' for VXLAN TCP segmentation offloading. */
+ static inline void
+@@ -1160,6 +1190,34 @@ static inline void
+ dp_packet_hwol_set_outer_l3_len(struct dp_packet *b, int outer_l3_len)
+ {
+ }
++
++/* Get l2_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_l2_len(struct dp_packet *b)
++{
++    return ((char *)dp_packet_l3(b) - (char *)dp_packet_eth(b));
++}
++
++/* Get l3_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_l3_len(struct dp_packet *b)
++{
++    return ((char *)dp_packet_l4(b) - (char *)dp_packet_l3(b));
++}
++
++/* Get outer_l2_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_outer_l2_len(struct dp_packet *b)
++{
++    return ((char *)dp_packet_l3(b) - (char *)dp_packet_eth(b));
++}
++
++/* Get outer_l3_len for the packet 'b' */
++static inline int
++dp_packet_hwol_get_outer_l3_len(struct dp_packet *b)
++{
++    return ((char *)dp_packet_l4(b) - (char *)dp_packet_l3(b));
++}
+ #endif /* DPDK_NETDEV */
+ 
+ static inline bool
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 6d0316f75..1d8e3b6a1 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2278,7 +2278,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         }
+ 
+         if (mbuf->ol_flags & PKT_TX_IPV4) {
+-            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            ip_hdr = (struct rte_ipv4_hdr *)((char *) eth_hdr
++                                                  + mbuf->outer_l2_len);
+             udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
+ 
+             /* outer IP checksum offload */
+@@ -2295,7 +2296,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             ip_hdr->hdr_checksum = 0;
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         } else if (mbuf->ol_flags & PKT_TX_IPV6) {
+-            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            ip_hdr = (struct rte_ipv4_hdr *)((char *) eth_hdr
++                                                  + mbuf->outer_l2_len);
+             udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
+ 
+             /* outer IP checksum offload */
+@@ -2326,9 +2328,13 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         }
+     } else if (mbuf->ol_flags & (PKT_TX_IPV4 | PKT_TX_IPV6)) {
+         /* Handle VLAN TSO */
+-            /* no inner IP checksum for IPV6 */
++        mbuf->l2_len = (char *)dp_packet_l3(pkt) - (char *)dp_packet_eth(pkt);
++        mbuf->l3_len = (char *)dp_packet_l4(pkt) - (char *)dp_packet_l3(pkt);
++        mbuf->outer_l2_len = 0;
++        mbuf->outer_l3_len = 0;
++
+         if (mbuf->ol_flags & PKT_TX_IPV4) {
+-            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            ip_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip_hdr->next_proto_id;
+             l3_hdr_ptr = (uint8_t *)ip_hdr;
+ 
+@@ -2336,7 +2342,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             ip_hdr->hdr_checksum = 0;
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         } else if (mbuf->ol_flags & PKT_TX_IPV6) {
+-            ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            ip6_hdr = (struct rte_ipv6_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
+             l3_hdr_ptr = (uint8_t *)ip6_hdr;
+ 
+@@ -2344,11 +2350,6 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+ 
+-        mbuf->l2_len = (char *)dp_packet_l3(pkt) - (char *)dp_packet_eth(pkt);
+-        mbuf->l3_len = (char *)dp_packet_l4(pkt) - (char *)dp_packet_l3(pkt);
+-        mbuf->outer_l2_len = 0;
+-        mbuf->outer_l3_len = 0;
+-
+         /* In case of GRO, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't set by GRO
+          * APIs, here is a place we can mark it.
+          */
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 7c9162b0e..7c1d42842 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1733,6 +1733,29 @@ netdev_linux_tap_batch_send(struct netdev *netdev_, bool tso, int mtu,
+         ssize_t retval;
+         int error;
+ 
++        /* It is a GROed packet which has multiple segments, so need to merge
++         * as a big packet in order that sendmmsg can handle it correctly.
++         */
++        if (packet->mbuf.nb_segs > 1) {
++            struct dp_packet *new_packet =
++                dp_packet_new_with_headroom(dp_packet_size(packet),
++                                            sizeof(struct virtio_net_hdr));
++            struct rte_mbuf *next = (struct rte_mbuf *)packet;
++            uint32_t offset = 0;
++
++            /* Copy multi-seg mbuf data to linear buffer */
++            while (next) {
++                memcpy((uint8_t *)dp_packet_data(new_packet) + offset,
++                       rte_pktmbuf_mtod(next, char *),
++                       next->data_len);
++                offset += next->data_len;
++                next = next->next;
++            }
++            dp_packet_set_size(new_packet, offset);
++            dp_packet_delete(packet);
++            batch->packets[i] = new_packet;
++            packet = new_packet;
++        }
+         if (tso) {
+             netdev_linux_prepend_vnet_hdr(packet, mtu);
+         }
+@@ -7183,12 +7206,9 @@ netdev_linux_prepend_vnet_hdr(struct dp_packet *b, int mtu OVS_UNUSED)
+ {
+     struct virtio_net_hdr *vnet;
+     uint16_t tso_segsz = get_userspace_tso_segsz();
++    uint16_t l4proto;
+ 
+-    /* Parse it if it is from vhostuser because it isn't parsed */
+-    if (b->mbuf.port == UINT16_MAX) {
+-        uint16_t l4proto;
+-        netdev_linux_parse_l2(b, &l4proto);
+-    }
++    netdev_linux_parse_l2(b, &l4proto);
+ 
+     /* ol_flags weren't set correctly for received packets which are from
+      * physical port and GROed, so it has to been set again in order that
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 568f443c1..6d30eebda 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -798,9 +798,17 @@ calculate_tcpudp_checksum(struct dp_packet *p)
+ {
+     uint32_t pseudo_hdr_csum;
+     struct ip_header *ip = dp_packet_l3(p);
++    size_t len_l2 = (char *) dp_packet_l3(p) - (char *) dp_packet_eth(p);
++    size_t len_l3 = (char *) dp_packet_l4(p) - (char *) dp_packet_l3(p);
+     size_t l4_len = (char *) dp_packet_tail(p) - (char *) dp_packet_l4(p);
+     uint16_t l4_proto = 0;
+ 
++    /* It is possible l2_len and l3_len aren't set here, so set them if no */
++    if (dp_packet_hwol_get_l2_len(p) != len_l2) {
++        dp_packet_hwol_set_l2_len(p, len_l2);
++        dp_packet_hwol_set_l3_len(p, len_l3);
++    }
++
+     l4_proto = ip->ip_proto;
+     ip->ip_csum = 0;
+     ip->ip_csum = csum(ip, sizeof *ip);
+@@ -980,6 +988,8 @@ netdev_pop_header(struct netdev *netdev, struct dp_packet_batch *batch)
+              * interpretation in the further packet processing when
+              * recirculated.*/
+             dp_packet_reset_offload(packet);
++            dp_packet_hwol_set_outer_l2_len(packet, 0);
++            dp_packet_hwol_set_outer_l3_len(packet, 0);
+             pkt_metadata_init_conn(&packet->md);
+             dp_packet_batch_refill(batch, packet, i);
+         }
+@@ -1034,6 +1044,10 @@ netdev_push_header(const struct netdev *netdev,
+                          "flags is not supported: packet dropped",
+                          netdev_get_name(netdev));
+         } else {
++            size_t len_l2 = (char *) dp_packet_l3(packet)
++                                - (char *) dp_packet_eth(packet);
++            size_t len_l3 = (char *) dp_packet_l4(packet)
++                                - (char *) dp_packet_l3(packet);
+             if (data->tnl_type == OVS_VPORT_TYPE_VXLAN) {
+                 /* VXLAN offload can't support udp checksum offload
+                  * for inner udp packet, so udp checksum must be set
+@@ -1060,6 +1074,14 @@ netdev_push_header(const struct netdev *netdev,
+                     }
+                 }
+             }
++            /* It is possible l2_len and l3_len aren't set here, so set them
++             * if no.
++             */
++            if (dp_packet_hwol_get_l2_len(packet) != len_l2) {
++                dp_packet_hwol_set_l2_len(packet, len_l2);
++                dp_packet_hwol_set_l3_len(packet, len_l3);
++            }
++
+             netdev->netdev_class->push_header(netdev, packet, data);
+             if (userspace_tso_enabled()
+                 && (data->tnl_type == OVS_VPORT_TYPE_VXLAN)) {
+-- 
+2.17.1
+

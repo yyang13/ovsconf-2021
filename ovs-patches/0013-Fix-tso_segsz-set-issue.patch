@@ -1,0 +1,58 @@
+From cc2d0ae4d0175b5c5c9760eeebbb7888356b185a Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Tue, 25 Aug 2020 05:34:34 -0400
+Subject: [PATCH 13/47] Fix tso_segsz set issue
+
+Note: maximum tso_segsz should be MTU plus ethernet
+header length.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 12e656631..a3d05b6a6 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2215,7 +2215,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      */
+     if (is_local_to_local(mbuf->port, dev)) {
+         if (mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)) {
+-            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
++            mbuf->tso_segsz = tso_segsz + mbuf->l2_len;
+         }
+         return true;
+     }
+@@ -2252,6 +2252,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         if (mbuf->tso_segsz > dev->mtu) {
+             mbuf->tso_segsz = dev->mtu;
+         }
++        mbuf->tso_segsz += mbuf->l2_len;
+ 
+         return true;
+     }
+@@ -2396,7 +2397,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ 
+         mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
+         if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
+-            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
++            mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
++                                  + mbuf->outer_l3_len + mbuf->l2_len;
+         } else {
+             mbuf->tso_segsz = 0;
+         }
+@@ -2454,8 +2456,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             /* FOR GSO, gso_size includes l2_len + l3_len */
+             mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
+                                   + mbuf->outer_l3_len + mbuf->l2_len;
+-            if (mbuf->tso_segsz > dev->mtu) {
+-                mbuf->tso_segsz = dev->mtu;
++            if (mbuf->tso_segsz > dev->mtu + ETH_HEADER_LEN) {
++                mbuf->tso_segsz = dev->mtu + ETH_HEADER_LEN;
+             }
+         }
+     }
+-- 
+2.17.1
+

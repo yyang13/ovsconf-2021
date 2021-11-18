@@ -1,0 +1,1063 @@
+From b9a0c00acd0eedb40848347f1e3d2c8b62a09e61 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 20 Dec 2020 21:10:50 -0500
+Subject: [PATCH 10/19] gro: support UDP/IPv6
+
+UDP/IPv6 GRO can help improve UDP/IPv6 performance.
+
+With this enabled in DPDK, OVS DPDK can leverage it
+to improve VM-to-VM UDP/IPv6 performance, it will merge
+small adjacent UDP/IPv6 fragments to a big UDP/IPv6 packet
+immediate after they are received from a physical NIC. It
+is very helpful in OVS DPDK VLAN use case.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ .../generic_receive_offload_lib.rst           |   6 +-
+ lib/librte_gro/Makefile                       |   1 +
+ lib/librte_gro/gro_udp6.c                     | 487 ++++++++++++++++++
+ lib/librte_gro/gro_udp6.h                     | 284 ++++++++++
+ lib/librte_gro/meson.build                    |   2 +-
+ lib/librte_gro/rte_gro.c                      |  72 ++-
+ lib/librte_gro/rte_gro.h                      |   3 +
+ 7 files changed, 843 insertions(+), 12 deletions(-)
+ create mode 100644 lib/librte_gro/gro_udp6.c
+ create mode 100644 lib/librte_gro/gro_udp6.h
+
+diff --git a/doc/guides/prog_guide/generic_receive_offload_lib.rst b/doc/guides/prog_guide/generic_receive_offload_lib.rst
+index 0efade31aa..0ea30763bc 100644
+--- a/doc/guides/prog_guide/generic_receive_offload_lib.rst
++++ b/doc/guides/prog_guide/generic_receive_offload_lib.rst
+@@ -31,9 +31,9 @@ fragmentation is possible (i.e., DF==0). Additionally, it complies RFC
+ 6864 to process the IPv4 ID field.
+ 
+ Currently, the GRO library provides GRO supports for TCP/IPv4, UDP/IPv4,
+-and TCP/IPv6 packets as well as VxLAN packets which contain an outer IPv4
+-header and an inner TCP/IPv4, UDP/IPv4 or TCP/IPv6 packet or an outer IPv6
+-header and an inner TCP/IPv4 or TCP/IPv6 packet.
++UDP/IPv6, and TCP/IPv6 packets as well as VxLAN packets which contain an
++outer IPv4 header and an inner TCP/IPv4, UDP/IPv4 or TCP/IPv6 packet or
++an outer IPv6 header and an inner TCP/IPv4 or TCP/IPv6 packet.
+ 
+ Two Sets of API
+ ---------------
+diff --git a/lib/librte_gro/Makefile b/lib/librte_gro/Makefile
+index 5b00aaefaf..6e46b78483 100644
+--- a/lib/librte_gro/Makefile
++++ b/lib/librte_gro/Makefile
+@@ -22,6 +22,7 @@ SRCS-$(CONFIG_RTE_LIBRTE_GRO) += gro_tcp6.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GRO) += gro_vxlan_tcp6.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GRO) += gro_vxlan6_tcp4.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GRO) += gro_vxlan6_tcp6.c
++SRCS-$(CONFIG_RTE_LIBRTE_GRO) += gro_udp6.c
+ 
+ # install this header file
+ SYMLINK-$(CONFIG_RTE_LIBRTE_GRO)-include += rte_gro.h
+diff --git a/lib/librte_gro/gro_udp6.c b/lib/librte_gro/gro_udp6.c
+new file mode 100644
+index 0000000000..193cf2ed0d
+--- /dev/null
++++ b/lib/librte_gro/gro_udp6.c
+@@ -0,0 +1,487 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2021 Inspur Corporation
++ */
++
++#include <rte_malloc.h>
++#include <rte_mbuf.h>
++#include <rte_cycles.h>
++#include <rte_ethdev.h>
++#include <rte_ip.h>
++
++#include "gro_udp6.h"
++
++void *
++gro_udp6_tbl_create(uint16_t socket_id,
++		uint16_t max_flow_num,
++		uint16_t max_item_per_flow)
++{
++	struct gro_udp6_tbl *tbl;
++	size_t size;
++	uint32_t entries_num, i;
++
++	entries_num = max_flow_num * max_item_per_flow;
++	entries_num = RTE_MIN(entries_num, GRO_UDP6_TBL_MAX_ITEM_NUM);
++
++	if (entries_num == 0)
++		return NULL;
++
++	tbl = rte_zmalloc_socket(__func__,
++			sizeof(struct gro_udp6_tbl),
++			RTE_CACHE_LINE_SIZE,
++			socket_id);
++	if (tbl == NULL)
++		return NULL;
++
++	size = sizeof(struct gro_udp6_item) * entries_num;
++	tbl->items = rte_zmalloc_socket(__func__,
++			size,
++			RTE_CACHE_LINE_SIZE,
++			socket_id);
++	if (tbl->items == NULL) {
++		rte_free(tbl);
++		return NULL;
++	}
++	tbl->max_item_num = entries_num;
++
++	size = sizeof(struct gro_udp6_flow) * entries_num;
++	tbl->flows = rte_zmalloc_socket(__func__,
++			size,
++			RTE_CACHE_LINE_SIZE,
++			socket_id);
++	if (tbl->flows == NULL) {
++		rte_free(tbl->items);
++		rte_free(tbl);
++		return NULL;
++	}
++	/* INVALID_ARRAY_INDEX indicates an empty flow */
++	for (i = 0; i < entries_num; i++)
++		tbl->flows[i].start_index = INVALID_ARRAY_INDEX;
++	tbl->max_flow_num = entries_num;
++
++	return tbl;
++}
++
++void
++gro_udp6_tbl_destroy(void *tbl)
++{
++	struct gro_udp6_tbl *udp6_tbl = tbl;
++
++	if (udp6_tbl) {
++		rte_free(udp6_tbl->items);
++		rte_free(udp6_tbl->flows);
++	}
++	rte_free(udp6_tbl);
++}
++
++static inline uint32_t
++find_an_empty_item(struct gro_udp6_tbl *tbl)
++{
++	uint32_t i;
++	uint32_t max_item_num = tbl->max_item_num;
++
++	for (i = 0; i < max_item_num; i++)
++		if (tbl->items[i].firstseg == NULL)
++			return i;
++	return INVALID_ARRAY_INDEX;
++}
++
++static inline uint32_t
++find_an_empty_flow(struct gro_udp6_tbl *tbl)
++{
++	uint32_t i;
++	uint32_t max_flow_num = tbl->max_flow_num;
++
++	for (i = 0; i < max_flow_num; i++)
++		if (tbl->flows[i].start_index == INVALID_ARRAY_INDEX)
++			return i;
++	return INVALID_ARRAY_INDEX;
++}
++
++static inline uint32_t
++insert_new_item(struct gro_udp6_tbl *tbl,
++		struct rte_mbuf *pkt,
++		uint64_t start_time,
++		uint32_t prev_idx,
++		uint16_t frag_offset,
++		uint8_t is_last_frag)
++{
++	uint32_t item_idx;
++
++	item_idx = find_an_empty_item(tbl);
++	if (item_idx == INVALID_ARRAY_INDEX)
++		return INVALID_ARRAY_INDEX;
++
++	tbl->items[item_idx].firstseg = pkt;
++	tbl->items[item_idx].lastseg = rte_pktmbuf_lastseg(pkt);
++	tbl->items[item_idx].start_time = start_time;
++	tbl->items[item_idx].next_pkt_idx = INVALID_ARRAY_INDEX;
++	tbl->items[item_idx].frag_offset = frag_offset;
++	tbl->items[item_idx].is_last_frag = is_last_frag;
++	tbl->items[item_idx].nb_merged = 1;
++	tbl->item_num++;
++
++	/* if the previous packet exists, chain them together. */
++	if (prev_idx != INVALID_ARRAY_INDEX) {
++		tbl->items[item_idx].next_pkt_idx =
++			tbl->items[prev_idx].next_pkt_idx;
++		tbl->items[prev_idx].next_pkt_idx = item_idx;
++	}
++
++	return item_idx;
++}
++
++static inline uint32_t
++delete_item(struct gro_udp6_tbl *tbl, uint32_t item_idx,
++		uint32_t prev_item_idx)
++{
++	uint32_t next_idx = tbl->items[item_idx].next_pkt_idx;
++
++	/* NULL indicates an empty item */
++	tbl->items[item_idx].firstseg = NULL;
++	tbl->item_num--;
++	if (prev_item_idx != INVALID_ARRAY_INDEX)
++		tbl->items[prev_item_idx].next_pkt_idx = next_idx;
++
++	return next_idx;
++}
++
++/* Copy IPv6 addr */
++static inline void gro_ipv6_addr_copy(const uint8_t *ipv6_from,
++				      uint8_t *ipv6_to)
++{
++	const uint64_t *from_words = (const uint64_t *)ipv6_from;
++	uint64_t *to_words   = (uint64_t *)ipv6_to;
++
++	to_words[0] = from_words[0];
++	to_words[1] = from_words[1];
++}
++
++static inline uint32_t
++insert_new_flow(struct gro_udp6_tbl *tbl,
++		struct udp6_flow_key *src,
++		uint32_t item_idx)
++{
++	struct udp6_flow_key *dst;
++	uint32_t flow_idx;
++
++	flow_idx = find_an_empty_flow(tbl);
++	if (unlikely(flow_idx == INVALID_ARRAY_INDEX))
++		return INVALID_ARRAY_INDEX;
++
++	dst = &(tbl->flows[flow_idx].key);
++
++	rte_ether_addr_copy(&(src->eth_saddr), &(dst->eth_saddr));
++	rte_ether_addr_copy(&(src->eth_daddr), &(dst->eth_daddr));
++	gro_ipv6_addr_copy(src->ip_saddr, dst->ip_saddr);
++	gro_ipv6_addr_copy(src->ip_daddr, dst->ip_daddr);
++	dst->ip_id = src->ip_id;
++
++	tbl->flows[flow_idx].start_index = item_idx;
++	tbl->flow_num++;
++
++	return flow_idx;
++}
++
++static inline uint16_t
++get_ipv6_frag_offset(struct rte_ipv6_fragment_ext *ipv6_frag_hdr)
++{
++	return ((rte_be_to_cpu_16(ipv6_frag_hdr->frag_data) >> 3) * 8);
++}
++
++static inline uint8_t
++is_last_ipv6_frag(struct rte_ipv6_fragment_ext *ipv6_frag_hdr)
++{
++	return (rte_be_to_cpu_16(ipv6_frag_hdr->frag_data) & 0x0001);
++}
++
++/*
++ * update the packet length for the flushed packet.
++ */
++static inline void
++update_header(struct gro_udp6_item *item)
++{
++	struct rte_ipv6_hdr *ipv6_hdr;
++	struct rte_mbuf *pkt = item->firstseg;
++	struct rte_ipv6_fragment_ext *ipv6_frag_hdr;
++	size_t fh_len = sizeof(*ipv6_frag_hdr);
++
++	ipv6_hdr = (struct rte_ipv6_hdr *)(rte_pktmbuf_mtod(pkt, char *) +
++			pkt->l2_len);
++	/* Note: payload_len includes extension headers and upper layers
++	 * data, but l3_len also includes extension headers, so need to
++	 * add length of extension headers if they exist.
++	 */
++	ipv6_hdr->payload_len = rte_cpu_to_be_16(pkt->pkt_len -
++			pkt->l2_len - pkt->l3_len);
++
++	/* Remove fragment extension header or clear MF flag */
++	if (item->is_last_frag && (ipv6_hdr->proto == IPPROTO_FRAGMENT)) {
++		uint16_t ip_ofs;
++
++		ipv6_frag_hdr = (struct rte_ipv6_fragment_ext *)(ipv6_hdr + 1);
++		ip_ofs = get_ipv6_frag_offset(ipv6_frag_hdr);
++		if (ip_ofs == 0) {
++			ipv6_hdr->proto = ipv6_frag_hdr->next_header;
++			pkt->l3_len -= fh_len;
++
++			/* Remove IPv6 fragment extension header */
++			memmove(rte_pktmbuf_mtod_offset(pkt, char *, fh_len),
++				rte_pktmbuf_mtod(pkt, char*),
++				pkt->outer_l2_len + pkt->outer_l3_len +
++					pkt->l2_len + pkt->l3_len);
++			rte_pktmbuf_adj(pkt, fh_len);
++		} else {
++			/* clear MF flag */
++			ipv6_frag_hdr->frag_data = rte_cpu_to_be_16(
++				(rte_be_to_cpu_16(ipv6_frag_hdr->frag_data) &
++					0xFFFE));
++			ipv6_hdr->payload_len += fh_len;
++		}
++	}
++}
++
++int32_t
++gro_udp6_reassemble(struct rte_mbuf *pkt,
++		struct gro_udp6_tbl *tbl,
++		uint64_t start_time)
++{
++	struct rte_ether_hdr *eth_hdr;
++	struct rte_ipv6_hdr *ipv6_hdr;
++	struct rte_ipv6_fragment_ext *ipv6_frag_hdr;
++	uint16_t fh_len = sizeof(*ipv6_frag_hdr);
++	uint16_t ip_dl;
++	uint32_t ip_id;
++	uint16_t hdr_len;
++	uint16_t frag_offset = 0;
++	uint8_t is_last_frag;
++
++	struct udp6_flow_key key;
++	uint32_t cur_idx, prev_idx, item_idx;
++	uint32_t i, max_flow_num, remaining_flow_num;
++	int cmp;
++	uint8_t find;
++
++	/*
++	 * Don't process the packet whose UDP header length is not equal
++	 * to 20.
++	 */
++	if (unlikely(pkt->l4_len != UDP_HDRLEN))
++		return -1;
++
++	eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
++	ipv6_hdr = (struct rte_ipv6_hdr *)((char *)eth_hdr + pkt->l2_len);
++
++	/* Note: l3_len includes length of extension headers */
++	hdr_len = pkt->l2_len + pkt->l3_len;
++
++	/*
++	 * Don't process non-fragment packet.
++	 */
++	if (ipv6_hdr->proto != IPPROTO_FRAGMENT)
++		return -1;
++
++	/*
++	 * Don't process the packet whose payload length is less than or
++	 * equal to 0.
++	 */
++	if (pkt->pkt_len <= hdr_len)
++		return -1;
++
++	ipv6_frag_hdr = (struct rte_ipv6_fragment_ext *)(ipv6_hdr + 1);
++	ip_dl = rte_be_to_cpu_16(ipv6_hdr->payload_len) - fh_len;
++	ip_id = rte_be_to_cpu_32(ipv6_frag_hdr->id);
++	frag_offset = get_ipv6_frag_offset(ipv6_frag_hdr);
++	is_last_frag = is_last_ipv6_frag(ipv6_frag_hdr);
++
++	rte_ether_addr_copy(&(eth_hdr->s_addr), &(key.eth_saddr));
++	rte_ether_addr_copy(&(eth_hdr->d_addr), &(key.eth_daddr));
++	gro_ipv6_addr_copy(ipv6_hdr->src_addr, key.ip_saddr);
++	gro_ipv6_addr_copy(ipv6_hdr->dst_addr, key.ip_daddr);
++	key.ip_id = ip_id;
++
++	/* Search for a matched flow. */
++	max_flow_num = tbl->max_flow_num;
++	remaining_flow_num = tbl->flow_num;
++	find = 0;
++	for (i = 0; i < max_flow_num && remaining_flow_num; i++) {
++		if (tbl->flows[i].start_index != INVALID_ARRAY_INDEX) {
++			if (is_same_udp6_flow(tbl->flows[i].key, key)) {
++				find = 1;
++				break;
++			}
++			remaining_flow_num--;
++		}
++	}
++
++	/*
++	 * Fail to find a matched flow. Insert a new flow and store the
++	 * packet into the flow.
++	 */
++	if (find == 0) {
++		item_idx = insert_new_item(tbl, pkt, start_time,
++				INVALID_ARRAY_INDEX, frag_offset,
++				is_last_frag);
++		if (item_idx == INVALID_ARRAY_INDEX)
++			return -1;
++		if (insert_new_flow(tbl, &key, item_idx) ==
++				INVALID_ARRAY_INDEX) {
++			/*
++			 * Fail to insert a new flow, so delete the
++			 * stored packet.
++			 */
++			delete_item(tbl, item_idx, INVALID_ARRAY_INDEX);
++			return -1;
++		}
++		return 0;
++	}
++
++	/*
++	 * Check all packets in the flow and try to find a neighbor for
++	 * the input packet.
++	 */
++	cur_idx = tbl->flows[i].start_index;
++	prev_idx = cur_idx;
++	do {
++		cmp = udp6_check_neighbor(&(tbl->items[cur_idx]),
++				frag_offset, ip_dl, 0);
++		if (cmp) {
++			if (merge_two_udp6_packets(&(tbl->items[cur_idx]),
++						pkt, cmp, frag_offset,
++						is_last_frag, 0))
++				return 1;
++			/*
++			 * Fail to merge the two packets, as the packet
++			 * length is greater than the max value. Store
++			 * the packet into the flow.
++			 */
++			if (insert_new_item(tbl, pkt, start_time, prev_idx,
++						frag_offset, is_last_frag) ==
++					INVALID_ARRAY_INDEX)
++				return -1;
++			return 0;
++		}
++
++		/* Ensure inserted items are ordered by frag_offset */
++		if (frag_offset
++			< tbl->items[cur_idx].frag_offset) {
++			break;
++		}
++
++		prev_idx = cur_idx;
++		cur_idx = tbl->items[cur_idx].next_pkt_idx;
++	} while (cur_idx != INVALID_ARRAY_INDEX);
++
++	/* Fail to find a neighbor, so store the packet into the flow. */
++	if (cur_idx == tbl->flows[i].start_index) {
++		/* Insert it before the first packet of the flow */
++		item_idx = insert_new_item(tbl, pkt, start_time,
++				INVALID_ARRAY_INDEX, frag_offset,
++				is_last_frag);
++		if (item_idx == INVALID_ARRAY_INDEX)
++			return -1;
++		tbl->items[item_idx].next_pkt_idx = cur_idx;
++		tbl->flows[i].start_index = item_idx;
++	} else {
++		if (insert_new_item(tbl, pkt, start_time, prev_idx,
++			frag_offset, is_last_frag) == INVALID_ARRAY_INDEX)
++			return -1;
++	}
++
++	return 0;
++}
++
++static int
++gro_udp6_merge_items(struct gro_udp6_tbl *tbl,
++			   uint32_t start_idx)
++{
++	uint16_t frag_offset;
++	uint8_t is_last_frag;
++	int16_t ip_dl;
++	struct rte_mbuf *pkt;
++	int cmp;
++	uint32_t item_idx;
++	uint16_t hdr_len;
++
++	item_idx = tbl->items[start_idx].next_pkt_idx;
++	while (item_idx != INVALID_ARRAY_INDEX) {
++		pkt = tbl->items[item_idx].firstseg;
++		hdr_len = pkt->outer_l2_len + pkt->outer_l3_len + pkt->l2_len +
++			pkt->l3_len;
++		ip_dl = pkt->pkt_len - hdr_len;
++		frag_offset = tbl->items[item_idx].frag_offset;
++		is_last_frag = tbl->items[item_idx].is_last_frag;
++		cmp = udp6_check_neighbor(&(tbl->items[start_idx]),
++					frag_offset, ip_dl, 0);
++		if (cmp) {
++			if (merge_two_udp6_packets(
++					&(tbl->items[start_idx]),
++					pkt, cmp, frag_offset,
++					is_last_frag, 0)) {
++				item_idx = delete_item(tbl, item_idx,
++							INVALID_ARRAY_INDEX);
++				tbl->items[start_idx].next_pkt_idx
++					= item_idx;
++			} else {
++				return 0;
++			}
++		} else {
++			return 0;
++		}
++	}
++
++	return 0;
++}
++
++uint16_t
++gro_udp6_tbl_timeout_flush(struct gro_udp6_tbl *tbl,
++		uint64_t flush_timestamp,
++		struct rte_mbuf **out,
++		uint16_t nb_out)
++{
++	uint16_t k = 0;
++	uint32_t i, j;
++	uint32_t max_flow_num = tbl->max_flow_num;
++
++	for (i = 0; i < max_flow_num; i++) {
++		if (unlikely(tbl->flow_num == 0))
++			return k;
++
++		j = tbl->flows[i].start_index;
++		while (j != INVALID_ARRAY_INDEX) {
++			if (tbl->items[j].start_time <= flush_timestamp) {
++				gro_udp6_merge_items(tbl, j);
++				out[k++] = tbl->items[j].firstseg;
++				if (tbl->items[j].nb_merged > 1)
++					update_header(&(tbl->items[j]));
++				/*
++				 * Delete the packet and get the next
++				 * packet in the flow.
++				 */
++				j = delete_item(tbl, j, INVALID_ARRAY_INDEX);
++				tbl->flows[i].start_index = j;
++				if (j == INVALID_ARRAY_INDEX)
++					tbl->flow_num--;
++
++				if (unlikely(k == nb_out))
++					return k;
++			} else
++				/*
++				 * The left packets in this flow won't be
++				 * timeout. Go to check other flows.
++				 */
++				break;
++		}
++	}
++	return k;
++}
++
++uint32_t
++gro_udp6_tbl_pkt_count(void *tbl)
++{
++	struct gro_udp6_tbl *gro_tbl = tbl;
++
++	if (gro_tbl)
++		return gro_tbl->item_num;
++
++	return 0;
++}
+diff --git a/lib/librte_gro/gro_udp6.h b/lib/librte_gro/gro_udp6.h
+new file mode 100644
+index 0000000000..92696e440e
+--- /dev/null
++++ b/lib/librte_gro/gro_udp6.h
+@@ -0,0 +1,284 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2021 Inspur Corporation
++ */
++
++#ifndef _GRO_UDP6_H_
++#define _GRO_UDP6_H_
++
++#include <rte_ip.h>
++#include <rte_udp.h>
++#include <rte_vxlan.h>
++
++#define INVALID_ARRAY_INDEX 0xffffffffUL
++#define GRO_UDP6_TBL_MAX_ITEM_NUM (1024UL * 1024UL)
++
++/*
++ * The max length of a IPv6 packet, which includes the length of the L3
++ * header, the L4 header and the data payload.
++ */
++#define MAX_IPV6_PKT_LENGTH UINT16_MAX
++
++#define UDP_HDRLEN 8
++
++/* Header fields representing a UDP/IPv6 flow */
++struct udp6_flow_key {
++	struct rte_ether_addr eth_saddr;
++	struct rte_ether_addr eth_daddr;
++	uint8_t ip_saddr[16];
++	uint8_t ip_daddr[16];
++
++	/* IP fragment for UDP does not contain UDP header
++	 * except the first one. But IP ID must be same.
++	 * ip_id of fragment is 32 bit for IPv6
++	 */
++	uint32_t ip_id;
++};
++
++struct gro_udp6_flow {
++	struct udp6_flow_key key;
++	/*
++	 * The index of the first packet in the flow.
++	 * INVALID_ARRAY_INDEX indicates an empty flow.
++	 */
++	uint32_t start_index;
++};
++
++struct gro_udp6_item {
++	/*
++	 * The first MBUF segment of the packet. If the value
++	 * is NULL, it means the item is empty.
++	 */
++	struct rte_mbuf *firstseg;
++	/* The last MBUF segment of the packet */
++	struct rte_mbuf *lastseg;
++	/*
++	 * The time when the first packet is inserted into the table.
++	 * This value won't be updated, even if the packet is merged
++	 * with other packets.
++	 */
++	uint64_t start_time;
++	/*
++	 * next_pkt_idx is used to chain the packets that
++	 * are in the same flow but can't be merged together
++	 * (e.g. caused by packet reordering).
++	 */
++	uint32_t next_pkt_idx;
++	/* offset of IP fragment packet */
++	uint16_t frag_offset;
++	/* is last IP fragment? */
++	uint8_t is_last_frag;
++	/* the number of merged packets */
++	uint16_t nb_merged;
++};
++
++/*
++ * UDP/IPv6 reassembly table structure.
++ */
++struct gro_udp6_tbl {
++	/* item array */
++	struct gro_udp6_item *items;
++	/* flow array */
++	struct gro_udp6_flow *flows;
++	/* current item number */
++	uint32_t item_num;
++	/* current flow num */
++	uint32_t flow_num;
++	/* item array size */
++	uint32_t max_item_num;
++	/* flow array size */
++	uint32_t max_flow_num;
++};
++
++/**
++ * This function creates a UDP/IPv6 reassembly table.
++ *
++ * @param socket_id
++ *  Socket index for allocating the UDP/IPv6 reassemble table
++ * @param max_flow_num
++ *  The maximum number of flows in the UDP/IPv6 GRO table
++ * @param max_item_per_flow
++ *  The maximum number of packets per flow
++ *
++ * @return
++ *  - Return the table pointer on success.
++ *  - Return NULL on failure.
++ */
++void *gro_udp6_tbl_create(uint16_t socket_id,
++		uint16_t max_flow_num,
++		uint16_t max_item_per_flow);
++
++/**
++ * This function destroys a UDP/IPv6 reassembly table.
++ *
++ * @param tbl
++ *  Pointer pointing to the UDP/IPv6 reassembly table.
++ */
++void gro_udp6_tbl_destroy(void *tbl);
++
++/**
++ * This function merges a UDP/IPv6 packet.
++ *
++ * This function does not check if the packet has correct checksums and
++ * does not re-calculate checksums for the merged packet. It returns the
++ * packet if it isn't UDP fragment or there is no available space in
++ * the table.
++ *
++ * @param pkt
++ *  Packet to reassemble
++ * @param tbl
++ *  Pointer pointing to the UDP/IPv6 reassembly table
++ * @start_time
++ *  The time when the packet is inserted into the table
++ *
++ * @return
++ *  - Return a positive value if the packet is merged.
++ *  - Return zero if the packet isn't merged but stored in the table.
++ *  - Return a negative value for invalid parameters or no available
++ *    space in the table.
++ */
++int32_t gro_udp6_reassemble(struct rte_mbuf *pkt,
++		struct gro_udp6_tbl *tbl,
++		uint64_t start_time);
++
++/**
++ * This function flushes timeout packets in a UDP/IPv6 reassembly table,
++ * and without updating checksums.
++ *
++ * @param tbl
++ *  UDP/IPv6 reassembly table pointer
++ * @param flush_timestamp
++ *  Flush packets which are inserted into the table before or at the
++ *  flush_timestamp.
++ * @param out
++ *  Pointer array used to keep flushed packets
++ * @param nb_out
++ *  The element number in 'out'. It also determines the maximum number of
++ *  packets that can be flushed finally.
++ *
++ * @return
++ *  The number of flushed packets
++ */
++uint16_t gro_udp6_tbl_timeout_flush(struct gro_udp6_tbl *tbl,
++		uint64_t flush_timestamp,
++		struct rte_mbuf **out,
++		uint16_t nb_out);
++
++/**
++ * This function returns the number of the packets in a UDP/IPv6
++ * reassembly table.
++ *
++ * @param tbl
++ *  UDP/IPv6 reassembly table pointer
++ *
++ * @return
++ *  The number of packets in the table
++ */
++uint32_t gro_udp6_tbl_pkt_count(void *tbl);
++
++#ifndef _GRO_TCP6_H_
++static inline int rte_is_same_ipv6_addr(const uint8_t *ipv6_a1,
++					const uint8_t *ipv6_a2)
++{
++	const uint64_t *w1 = (const uint64_t *)ipv6_a1;
++	const uint64_t *w2 = (const uint64_t *)ipv6_a2;
++
++	return ((w1[0] ^ w2[0]) | (w1[1] ^ w2[1])) == 0;
++}
++#endif
++
++/*
++ * Check if two UDP/IPv6 packets belong to the same flow.
++ */
++static inline int
++is_same_udp6_flow(struct udp6_flow_key k1, struct udp6_flow_key k2)
++{
++	return (rte_is_same_ether_addr(&k1.eth_saddr, &k2.eth_saddr) &&
++			rte_is_same_ether_addr(&k1.eth_daddr, &k2.eth_daddr) &&
++			rte_is_same_ipv6_addr(k1.ip_saddr, k2.ip_saddr) &&
++			rte_is_same_ipv6_addr(k1.ip_daddr, k2.ip_daddr) &&
++			(k1.ip_id == k2.ip_id));
++}
++
++/*
++ * Merge two UDP/IPv6 packets without updating checksums.
++ * If cmp is larger than 0, append the new packet to the
++ * original packet. Otherwise, pre-pend the new packet to
++ * the original packet.
++ */
++static inline int
++merge_two_udp6_packets(struct gro_udp6_item *item,
++		struct rte_mbuf *pkt,
++		int cmp,
++		uint16_t frag_offset,
++		uint8_t is_last_frag,
++		uint16_t l2_offset)
++{
++	struct rte_mbuf *pkt_head, *pkt_tail, *lastseg;
++	uint16_t hdr_len, l2_len;
++	uint32_t ip_len;
++
++	if (cmp > 0) {
++		pkt_head = item->firstseg;
++		pkt_tail = pkt;
++	} else {
++		pkt_head = pkt;
++		pkt_tail = item->firstseg;
++	}
++
++	/* check if the IPv6 packet length is greater than the max value */
++	hdr_len = l2_offset + pkt_head->l2_len + pkt_head->l3_len;
++	l2_len = l2_offset > 0 ? pkt_head->outer_l2_len : pkt_head->l2_len;
++	ip_len = pkt_head->pkt_len - l2_len
++		 + pkt_tail->pkt_len - hdr_len;
++	if (unlikely(ip_len > MAX_IPV6_PKT_LENGTH))
++		return 0;
++
++	/* remove the packet header for the tail packet */
++	rte_pktmbuf_adj(pkt_tail, hdr_len);
++
++	/* chain two packets together */
++	if (cmp > 0) {
++		item->lastseg->next = pkt;
++		item->lastseg = rte_pktmbuf_lastseg(pkt);
++	} else {
++		lastseg = rte_pktmbuf_lastseg(pkt);
++		lastseg->next = item->firstseg;
++		item->firstseg = pkt;
++		item->frag_offset = frag_offset;
++	}
++	item->nb_merged++;
++	if (is_last_frag)
++		item->is_last_frag = is_last_frag;
++
++	/* update MBUF metadata for the merged packet */
++	pkt_head->nb_segs += pkt_tail->nb_segs;
++	pkt_head->pkt_len += pkt_tail->pkt_len;
++
++	return 1;
++}
++
++/*
++ * Check if two UDP/IPv6 packets are neighbors.
++ */
++static inline int
++udp6_check_neighbor(struct gro_udp6_item *item,
++		uint16_t frag_offset,
++		uint16_t ip_dl,
++		uint16_t l2_offset)
++{
++	struct rte_mbuf *pkt_orig = item->firstseg;
++	uint16_t len;
++
++	/* check if the two packets are neighbors */
++	len = pkt_orig->pkt_len - l2_offset - pkt_orig->l2_len -
++		pkt_orig->l3_len;
++	if (frag_offset == item->frag_offset + len)
++		/* append the new packet */
++		return 1;
++	else if (frag_offset + ip_dl == item->frag_offset)
++		/* pre-pend the new packet */
++		return -1;
++
++	return 0;
++}
++#endif
+diff --git a/lib/librte_gro/meson.build b/lib/librte_gro/meson.build
+index 3eff89c6c2..7939081049 100644
+--- a/lib/librte_gro/meson.build
++++ b/lib/librte_gro/meson.build
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: BSD-3-Clause
+ # Copyright(c) 2017 Intel Corporation
+ 
+-sources = files('rte_gro.c', 'gro_tcp4.c', 'gro_udp4.c', 'gro_vxlan_tcp4.c', 'gro_vxlan_udp4.c', 'gro_tcp6.c', 'gro_vxlan_tcp6.c', 'gro_vxlan6_tcp4.c', 'gro_vxlan6_tcp6.c')
++sources = files('rte_gro.c', 'gro_tcp4.c', 'gro_udp4.c', 'gro_vxlan_tcp4.c', 'gro_vxlan_udp4.c', 'gro_tcp6.c', 'gro_vxlan_tcp6.c', 'gro_vxlan6_tcp4.c', 'gro_vxlan6_tcp6.c', 'gro_udp6.c')
+ headers = files('rte_gro.h')
+ deps += ['ethdev']
+diff --git a/lib/librte_gro/rte_gro.c b/lib/librte_gro/rte_gro.c
+index 0f8be4114e..a57cc0c49e 100644
+--- a/lib/librte_gro/rte_gro.c
++++ b/lib/librte_gro/rte_gro.c
+@@ -11,6 +11,7 @@
+ #include "gro_tcp4.h"
+ #include "gro_tcp6.h"
+ #include "gro_udp4.h"
++#include "gro_udp6.h"
+ #include "gro_vxlan6_tcp4.h"
+ #include "gro_vxlan6_tcp6.h"
+ #include "gro_vxlan_tcp4.h"
+@@ -28,21 +29,21 @@ static gro_tbl_create_fn tbl_create_fn[RTE_GRO_TYPE_MAX_NUM] = {
+ 		gro_udp4_tbl_create, gro_vxlan_udp4_tbl_create,
+ 		gro_tcp6_tbl_create, gro_vxlan_tcp6_tbl_create,
+ 		gro_vxlan6_tcp4_tbl_create, gro_vxlan6_tcp6_tbl_create,
+-		NULL};
++		gro_udp6_tbl_create, NULL};
+ static gro_tbl_destroy_fn tbl_destroy_fn[RTE_GRO_TYPE_MAX_NUM] = {
+ 			gro_tcp4_tbl_destroy, gro_vxlan_tcp4_tbl_destroy,
+ 			gro_udp4_tbl_destroy, gro_vxlan_udp4_tbl_destroy,
+ 			gro_tcp6_tbl_destroy, gro_vxlan_tcp6_tbl_destroy,
+ 			gro_vxlan6_tcp4_tbl_destroy,
+ 			gro_vxlan6_tcp6_tbl_destroy,
+-			NULL};
++			gro_udp6_tbl_destroy, NULL};
+ static gro_tbl_pkt_count_fn tbl_pkt_count_fn[RTE_GRO_TYPE_MAX_NUM] = {
+ 			gro_tcp4_tbl_pkt_count, gro_vxlan_tcp4_tbl_pkt_count,
+ 			gro_udp4_tbl_pkt_count, gro_vxlan_udp4_tbl_pkt_count,
+ 			gro_tcp6_tbl_pkt_count, gro_vxlan_tcp6_tbl_pkt_count,
+ 			gro_vxlan6_tcp4_tbl_pkt_count,
+ 			gro_vxlan6_tcp6_tbl_pkt_count,
+-			NULL};
++			gro_udp6_tbl_pkt_count, NULL};
+ 
+ #define IS_IPV4_TCP_PKT(ptype) (RTE_ETH_IS_IPV4_HDR(ptype) && \
+ 		((ptype & RTE_PTYPE_L4_TCP) == RTE_PTYPE_L4_TCP) && \
+@@ -119,6 +120,10 @@ static gro_tbl_pkt_count_fn tbl_pkt_count_fn[RTE_GRO_TYPE_MAX_NUM] = {
+ 		 ((ptype & RTE_PTYPE_INNER_L3_MASK) == \
+ 		  RTE_PTYPE_INNER_L3_IPV6_EXT_UNKNOWN)))
+ 
++#define IS_IPV6_UDP_PKT(ptype) (RTE_ETH_IS_IPV6_HDR(ptype) && \
++		((ptype & RTE_PTYPE_L4_UDP) == RTE_PTYPE_L4_UDP) && \
++		(RTE_ETH_IS_TUNNEL_PKT(ptype) == 0))
++
+ /*
+  * GRO context structure. It keeps the table structures, which are
+  * used to merge packets, for different GRO types. Before using
+@@ -244,13 +249,19 @@ rte_gro_reassemble_burst(struct rte_mbuf **pkts,
+ 	struct gro_vxlan6_tcp6_item
+ 		vxlan6_tcp6_items[RTE_GRO_MAX_BURST_ITEM_NUM] = {{{0}} };
+ 
++	/* allocate a reassembly table for UDP/IPv6 GRO */
++	struct gro_udp6_tbl udp6_tbl;
++	struct gro_udp6_flow udp6_flows[RTE_GRO_MAX_BURST_ITEM_NUM];
++	struct gro_udp6_item udp6_items[RTE_GRO_MAX_BURST_ITEM_NUM] = {{0} };
++
+ 	struct rte_mbuf *unprocess_pkts[nb_pkts];
+ 	uint32_t item_num;
+ 	int32_t ret;
+ 	uint16_t i, unprocess_num = 0, nb_after_gro = nb_pkts;
+ 	uint8_t do_tcp4_gro = 0, do_vxlan_tcp_gro = 0, do_udp4_gro = 0,
+ 		do_vxlan_udp_gro = 0, do_tcp6_gro = 0, do_vxlan_tcp6_gro = 0,
+-		do_vxlan6_tcp4_gro = 0, do_vxlan6_tcp6_gro = 0;
++		do_vxlan6_tcp4_gro = 0, do_vxlan6_tcp6_gro = 0,
++		do_udp6_gro = 0;
+ 
+ 	if (unlikely((param->gro_types & (RTE_GRO_IPV4_VXLAN_TCP_IPV4 |
+ 					RTE_GRO_TCP_IPV4 |
+@@ -259,7 +270,8 @@ rte_gro_reassemble_burst(struct rte_mbuf **pkts,
+ 					RTE_GRO_TCP_IPV6 |
+ 					RTE_GRO_IPV4_VXLAN_TCP_IPV6 |
+ 					RTE_GRO_IPV6_VXLAN_TCP_IPV4 |
+-					RTE_GRO_IPV6_VXLAN_TCP_IPV6)) == 0))
++					RTE_GRO_IPV6_VXLAN_TCP_IPV6 |
++					RTE_GRO_UDP_IPV6)) == 0))
+ 		return nb_pkts;
+ 
+ 	/* Get the maximum number of packets */
+@@ -371,6 +383,19 @@ rte_gro_reassemble_burst(struct rte_mbuf **pkts,
+ 		do_vxlan6_tcp6_gro = 1;
+ 	}
+ 
++	if (param->gro_types & RTE_GRO_UDP_IPV6) {
++		for (i = 0; i < item_num; i++)
++			udp6_flows[i].start_index = INVALID_ARRAY_INDEX;
++
++		udp6_tbl.flows = udp6_flows;
++		udp6_tbl.items = udp6_items;
++		udp6_tbl.flow_num = 0;
++		udp6_tbl.item_num = 0;
++		udp6_tbl.max_flow_num = item_num;
++		udp6_tbl.max_item_num = item_num;
++		do_udp6_gro = 1;
++	}
++
+ 	for (i = 0; i < nb_pkts; i++) {
+ 		/*
+ 		 * The timestamp is ignored, since all packets
+@@ -445,6 +470,14 @@ rte_gro_reassemble_burst(struct rte_mbuf **pkts,
+ 				nb_after_gro--;
+ 			else if (ret < 0)
+ 				unprocess_pkts[unprocess_num++] = pkts[i];
++		} else if (IS_IPV6_UDP_PKT(pkts[i]->packet_type) &&
++				do_udp6_gro) {
++			ret = gro_udp6_reassemble(pkts[i], &udp6_tbl, 0);
++			if (ret > 0)
++				/* merge successfully */
++				nb_after_gro--;
++			else if (ret < 0)
++				unprocess_pkts[unprocess_num++] = pkts[i];
+ 		} else
+ 			unprocess_pkts[unprocess_num++] = pkts[i];
+ 	}
+@@ -494,6 +527,11 @@ rte_gro_reassemble_burst(struct rte_mbuf **pkts,
+ 					0, &pkts[i], nb_pkts - i);
+ 		}
+ 
++		if (do_udp6_gro) {
++			i += gro_udp6_tbl_timeout_flush(&udp6_tbl, 0,
++					&pkts[i], nb_pkts - i);
++		}
++
+ 		/* Copy unprocessed packets */
+ 		if (unprocess_num > 0) {
+ 			memcpy(&pkts[i], unprocess_pkts,
+@@ -514,12 +552,13 @@ rte_gro_reassemble(struct rte_mbuf **pkts,
+ 	struct rte_mbuf *unprocess_pkts[nb_pkts];
+ 	struct gro_ctx *gro_ctx = ctx;
+ 	void *tcp_tbl, *udp_tbl, *vxlan_tcp_tbl, *vxlan_udp_tbl, *tcp6_tbl,
+-		*vxlan_tcp6_tbl, *vxlan6_tcp4_tbl, *vxlan6_tcp6_tbl;
++		*vxlan_tcp6_tbl, *vxlan6_tcp4_tbl, *vxlan6_tcp6_tbl,
++		*udp6_tbl;
+ 	uint64_t current_time;
+ 	uint16_t i, unprocess_num = 0;
+ 	uint8_t do_tcp4_gro, do_vxlan_tcp_gro, do_udp4_gro, do_vxlan_udp_gro,
+ 		do_tcp6_gro, do_vxlan_tcp6_gro, do_vxlan6_tcp4_gro,
+-		do_vxlan6_tcp6_gro;
++		do_vxlan6_tcp6_gro, do_udp6_gro;
+ 
+ 	if (unlikely((gro_ctx->gro_types & (RTE_GRO_IPV4_VXLAN_TCP_IPV4 |
+ 					RTE_GRO_TCP_IPV4 |
+@@ -528,7 +567,8 @@ rte_gro_reassemble(struct rte_mbuf **pkts,
+ 					RTE_GRO_TCP_IPV6 |
+ 					RTE_GRO_IPV4_VXLAN_TCP_IPV6 |
+ 					RTE_GRO_IPV6_VXLAN_TCP_IPV4 |
+-					RTE_GRO_IPV6_VXLAN_TCP_IPV6)) == 0))
++					RTE_GRO_IPV6_VXLAN_TCP_IPV6 |
++					RTE_GRO_UDP_IPV6)) == 0))
+ 		return nb_pkts;
+ 
+ 	tcp_tbl = gro_ctx->tbls[RTE_GRO_TCP_IPV4_INDEX];
+@@ -539,6 +579,7 @@ rte_gro_reassemble(struct rte_mbuf **pkts,
+ 	vxlan_tcp6_tbl = gro_ctx->tbls[RTE_GRO_IPV4_VXLAN_TCP_IPV6_INDEX];
+ 	vxlan6_tcp4_tbl = gro_ctx->tbls[RTE_GRO_IPV6_VXLAN_TCP_IPV4_INDEX];
+ 	vxlan6_tcp6_tbl = gro_ctx->tbls[RTE_GRO_IPV6_VXLAN_TCP_IPV6_INDEX];
++	udp6_tbl = gro_ctx->tbls[RTE_GRO_UDP_IPV6_INDEX];
+ 
+ 	do_tcp4_gro = (gro_ctx->gro_types & RTE_GRO_TCP_IPV4) ==
+ 		RTE_GRO_TCP_IPV4;
+@@ -556,6 +597,8 @@ rte_gro_reassemble(struct rte_mbuf **pkts,
+ 				== RTE_GRO_IPV6_VXLAN_TCP_IPV4;
+ 	do_vxlan6_tcp6_gro = (gro_ctx->gro_types & RTE_GRO_IPV6_VXLAN_TCP_IPV6)
+ 				== RTE_GRO_IPV6_VXLAN_TCP_IPV6;
++	do_udp6_gro = (gro_ctx->gro_types & RTE_GRO_UDP_IPV6) ==
++		RTE_GRO_UDP_IPV6;
+ 
+ 	current_time = rte_rdtsc();
+ 
+@@ -600,6 +643,11 @@ rte_gro_reassemble(struct rte_mbuf **pkts,
+ 			if (gro_vxlan6_tcp6_reassemble(pkts[i], vxlan6_tcp6_tbl,
+ 						current_time) < 0)
+ 				unprocess_pkts[unprocess_num++] = pkts[i];
++		} else if (IS_IPV6_UDP_PKT(pkts[i]->packet_type) &&
++				do_udp6_gro) {
++			if (gro_udp6_reassemble(pkts[i], udp6_tbl,
++						current_time) < 0)
++				unprocess_pkts[unprocess_num++] = pkts[i];
+ 		} else
+ 			unprocess_pkts[unprocess_num++] = pkts[i];
+ 	}
+@@ -683,6 +731,14 @@ rte_gro_timeout_flush(void *ctx,
+ 		num += gro_vxlan6_tcp6_tbl_timeout_flush(gro_ctx->tbls[
+ 				RTE_GRO_IPV6_VXLAN_TCP_IPV6_INDEX],
+ 				flush_timestamp, &out[num], left_nb_out);
++		left_nb_out = max_nb_out - num;
++	}
++
++	if ((gro_types & RTE_GRO_UDP_IPV6) && left_nb_out > 0) {
++		num += gro_udp6_tbl_timeout_flush(
++				gro_ctx->tbls[RTE_GRO_UDP_IPV6_INDEX],
++				flush_timestamp,
++				&out[num], left_nb_out);
+ 	}
+ 
+ 	return num;
+diff --git a/lib/librte_gro/rte_gro.h b/lib/librte_gro/rte_gro.h
+index cb0895f03d..94ed3d3843 100644
+--- a/lib/librte_gro/rte_gro.h
++++ b/lib/librte_gro/rte_gro.h
+@@ -50,6 +50,9 @@ extern "C" {
+ #define RTE_GRO_IPV6_VXLAN_TCP_IPV6_INDEX 7
+ #define RTE_GRO_IPV6_VXLAN_TCP_IPV6 (1ULL << RTE_GRO_IPV6_VXLAN_TCP_IPV6_INDEX)
+ /**< IPv6 VxLAN TCP/IPv6 GRO flag. */
++#define RTE_GRO_UDP_IPV6_INDEX 8
++#define RTE_GRO_UDP_IPV6 (1ULL << RTE_GRO_UDP_IPV6_INDEX)
++/**< UDP/IPv6 GRO flag */
+ 
+ /**
+  * Structure used to create GRO context objects or used to pass
+-- 
+2.17.1
+

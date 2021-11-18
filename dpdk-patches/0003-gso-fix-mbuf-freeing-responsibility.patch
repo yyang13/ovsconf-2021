@@ -1,0 +1,276 @@
+From c107578d9dc733a3b84d169dc7259d6c507acbb6 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 26 Oct 2020 14:47:13 +0800
+Subject: [PATCH 03/19] gso: fix mbuf freeing responsibility
+
+rte_gso_segment decreased refcnt of pkt by one, but
+it is wrong if pkt is external mbuf, pkt won't be
+freed because of incorrect refcnt, the result is
+application can't allocate mbuf from mempool because
+mbufs in mempool are run out of.
+
+One correct way is application should call
+rte_pktmbuf_free after calling rte_gso_segment to free
+pkt explicitly. rte_gso_segment must not handle it, this
+should be responsibility of application.
+
+This commit changed rte_gso_segment in functional behavior
+and return value, so the application must take appropriate
+actions according to return values, "ret < 0" means it
+should free and drop 'pkt', "ret == 0" means 'pkt' isn't
+GSOed but 'pkt' can be transmitted as a normal packet,
+"ret > 0" means 'pkt' has been GSOed into two or multiple
+segments, it should use "pkts_out" to transmit these
+segments. The application must free 'pkt' after call
+rte_gso_segment when return value isn't equal to 0.
+
+Fixes: 119583797b6a ("gso: support TCP/IPv4 GSO")
+Cc: stable@dpdk.org
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+Acked-by: Jiayu Hu <jiayu.hu@intel.com>
+Acked-by: Konstantin Ananyev <konstantin.ananyev@intel.com>
+---
+ app/test-pmd/csumonly.c                           | 12 ++++++++++--
+ .../generic_segmentation_offload_lib.rst          |  7 +++++--
+ drivers/net/tap/rte_eth_tap.c                     | 12 ++++++++++--
+ lib/librte_gso/gso_tcp4.c                         |  6 ++----
+ lib/librte_gso/gso_tunnel_tcp4.c                  | 14 +++++---------
+ lib/librte_gso/gso_udp4.c                         |  6 ++----
+ lib/librte_gso/rte_gso.c                          | 15 +++------------
+ lib/librte_gso/rte_gso.h                          |  8 ++++++--
+ 8 files changed, 43 insertions(+), 37 deletions(-)
+
+diff --git a/app/test-pmd/csumonly.c b/app/test-pmd/csumonly.c
+index 7b92ab1195..d0eef8b51c 100644
+--- a/app/test-pmd/csumonly.c
++++ b/app/test-pmd/csumonly.c
+@@ -1050,9 +1050,17 @@ pkt_burst_checksum_forward(struct fwd_stream *fs)
+ 			ret = rte_gso_segment(pkts_burst[i], gso_ctx,
+ 					&gso_segments[nb_segments],
+ 					GSO_MAX_PKT_BURST - nb_segments);
+-			if (ret >= 0)
++			if (ret >= 1) {
++				/* pkts_burst[i] can be freed safely here. */
++				rte_pktmbuf_free(pkts_burst[i]);
+ 				nb_segments += ret;
+-			else {
++			} else if (ret == 0) {
++				/* 0 means it can be transmitted directly
++				 * without gso.
++				 */
++				gso_segments[nb_segments] = pkts_burst[i];
++				nb_segments += 1;
++			} else {
+ 				TESTPMD_LOG(DEBUG, "Unable to segment packet");
+ 				rte_pktmbuf_free(pkts_burst[i]);
+ 			}
+diff --git a/doc/guides/prog_guide/generic_segmentation_offload_lib.rst b/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
+index 205cb8a866..ad91c6e5fc 100644
+--- a/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
++++ b/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
+@@ -25,8 +25,9 @@ Bearing that in mind, the GSO library enables DPDK applications to segment
+ packets in software. Note however, that GSO is implemented as a standalone
+ library, and not via a 'fallback' mechanism (i.e. for when TSO is unsupported
+ in the underlying hardware); that is, applications must explicitly invoke the
+-GSO library to segment packets. The size of GSO segments ``(segsz)`` is
+-configurable by the application.
++GSO library to segment packets, they also must call ``rte_pktmbuf_free()``
++to free mbuf GSO segments attached after calling ``rte_gso_segment()``.
++The size of GSO segments (``segsz``) is configurable by the application.
+ 
+ Limitations
+ -----------
+@@ -233,6 +234,8 @@ To segment an outgoing packet, an application must:
+ 
+ #. Invoke the GSO segmentation API, ``rte_gso_segment()``.
+ 
++#. Call ``rte_pktmbuf_free()`` to free mbuf ``rte_gso_segment()`` segments.
++
+ #. If required, update the L3 and L4 checksums of the newly-created segments.
+    For tunneled packets, the outer IPv4 headers' checksums should also be
+    updated. Alternatively, the application may offload checksum calculation
+diff --git a/drivers/net/tap/rte_eth_tap.c b/drivers/net/tap/rte_eth_tap.c
+index cfbd579cd6..1e2f21d96f 100644
+--- a/drivers/net/tap/rte_eth_tap.c
++++ b/drivers/net/tap/rte_eth_tap.c
+@@ -713,8 +713,16 @@ pmd_tx_burst(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
+ 			if (num_tso_mbufs < 0)
+ 				break;
+ 
+-			mbuf = gso_mbufs;
+-			num_mbufs = num_tso_mbufs;
++			if (num_tso_mbufs >= 1) {
++				mbuf = gso_mbufs;
++				num_mbufs = num_tso_mbufs;
++			} else {
++				/* 0 means it can be transmitted directly
++				 * without gso.
++				 */
++				mbuf = &mbuf_in;
++				num_mbufs = 1;
++			}
+ 		} else {
+ 			/* stats.errs will be incremented */
+ 			if (rte_pktmbuf_pkt_len(mbuf_in) > max_size)
+diff --git a/lib/librte_gso/gso_tcp4.c b/lib/librte_gso/gso_tcp4.c
+index ade172ac73..d31feaff95 100644
+--- a/lib/librte_gso/gso_tcp4.c
++++ b/lib/librte_gso/gso_tcp4.c
+@@ -50,15 +50,13 @@ gso_tcp4_segment(struct rte_mbuf *pkt,
+ 			pkt->l2_len);
+ 	frag_off = rte_be_to_cpu_16(ipv4_hdr->fragment_offset);
+ 	if (unlikely(IS_FRAGMENTED(frag_off))) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	/* Don't process the packet without data */
+ 	hdr_offset = pkt->l2_len + pkt->l3_len + pkt->l4_len;
+ 	if (unlikely(hdr_offset >= pkt->pkt_len)) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	pyld_unit_size = gso_size - hdr_offset;
+diff --git a/lib/librte_gso/gso_tunnel_tcp4.c b/lib/librte_gso/gso_tunnel_tcp4.c
+index e0384c26d0..166aace73a 100644
+--- a/lib/librte_gso/gso_tunnel_tcp4.c
++++ b/lib/librte_gso/gso_tunnel_tcp4.c
+@@ -62,7 +62,7 @@ gso_tunnel_tcp4_segment(struct rte_mbuf *pkt,
+ {
+ 	struct rte_ipv4_hdr *inner_ipv4_hdr;
+ 	uint16_t pyld_unit_size, hdr_offset, frag_off;
+-	int ret = 1;
++	int ret;
+ 
+ 	hdr_offset = pkt->outer_l2_len + pkt->outer_l3_len + pkt->l2_len;
+ 	inner_ipv4_hdr = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(pkt, char *) +
+@@ -73,25 +73,21 @@ gso_tunnel_tcp4_segment(struct rte_mbuf *pkt,
+ 	 */
+ 	frag_off = rte_be_to_cpu_16(inner_ipv4_hdr->fragment_offset);
+ 	if (unlikely(IS_FRAGMENTED(frag_off))) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	hdr_offset += pkt->l3_len + pkt->l4_len;
+ 	/* Don't process the packet without data */
+ 	if (hdr_offset >= pkt->pkt_len) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 	pyld_unit_size = gso_size - hdr_offset;
+ 
+ 	/* Segment the payload */
+ 	ret = gso_do_segment(pkt, hdr_offset, pyld_unit_size, direct_pool,
+ 			indirect_pool, pkts_out, nb_pkts_out);
+-	if (ret <= 1)
+-		return ret;
+-
+-	update_tunnel_ipv4_tcp_headers(pkt, ipid_delta, pkts_out, ret);
++	if (ret > 1)
++		update_tunnel_ipv4_tcp_headers(pkt, ipid_delta, pkts_out, ret);
+ 
+ 	return ret;
+ }
+diff --git a/lib/librte_gso/gso_udp4.c b/lib/librte_gso/gso_udp4.c
+index 6fa68f243a..5d0186aa24 100644
+--- a/lib/librte_gso/gso_udp4.c
++++ b/lib/librte_gso/gso_udp4.c
+@@ -52,8 +52,7 @@ gso_udp4_segment(struct rte_mbuf *pkt,
+ 			pkt->l2_len);
+ 	frag_off = rte_be_to_cpu_16(ipv4_hdr->fragment_offset);
+ 	if (unlikely(IS_FRAGMENTED(frag_off))) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	/*
+@@ -65,8 +64,7 @@ gso_udp4_segment(struct rte_mbuf *pkt,
+ 
+ 	/* Don't process the packet without data. */
+ 	if (unlikely(hdr_offset + pkt->l4_len >= pkt->pkt_len)) {
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	/* pyld_unit_size must be a multiple of 8 because frag_off
+diff --git a/lib/librte_gso/rte_gso.c b/lib/librte_gso/rte_gso.c
+index 751b5b625e..896350ebc8 100644
+--- a/lib/librte_gso/rte_gso.c
++++ b/lib/librte_gso/rte_gso.c
+@@ -30,7 +30,6 @@ rte_gso_segment(struct rte_mbuf *pkt,
+ 		uint16_t nb_pkts_out)
+ {
+ 	struct rte_mempool *direct_pool, *indirect_pool;
+-	struct rte_mbuf *pkt_seg;
+ 	uint64_t ol_flags;
+ 	uint16_t gso_size;
+ 	uint8_t ipid_delta;
+@@ -44,8 +43,7 @@ rte_gso_segment(struct rte_mbuf *pkt,
+ 
+ 	if (gso_ctx->gso_size >= pkt->pkt_len) {
+ 		pkt->ol_flags &= (~(PKT_TX_TCP_SEG | PKT_TX_UDP_SEG));
+-		pkts_out[0] = pkt;
+-		return 1;
++		return 0;
+ 	}
+ 
+ 	direct_pool = gso_ctx->direct_pool;
+@@ -75,18 +73,11 @@ rte_gso_segment(struct rte_mbuf *pkt,
+ 				indirect_pool, pkts_out, nb_pkts_out);
+ 	} else {
+ 		/* unsupported packet, skip */
+-		pkts_out[0] = pkt;
+ 		RTE_LOG(DEBUG, GSO, "Unsupported packet type\n");
+-		return 1;
++		ret = 0;
+ 	}
+ 
+-	if (ret > 1) {
+-		pkt_seg = pkt;
+-		while (pkt_seg) {
+-			rte_mbuf_refcnt_update(pkt_seg, -1);
+-			pkt_seg = pkt_seg->next;
+-		}
+-	} else if (ret < 0) {
++	if (ret < 0) {
+ 		/* Revert the ol_flags in the event of failure. */
+ 		pkt->ol_flags = ol_flags;
+ 	}
+diff --git a/lib/librte_gso/rte_gso.h b/lib/librte_gso/rte_gso.h
+index 3aab297f44..d93ee8e5b1 100644
+--- a/lib/librte_gso/rte_gso.h
++++ b/lib/librte_gso/rte_gso.h
+@@ -89,8 +89,11 @@ struct rte_gso_ctx {
+  * the GSO segments are sent to should support transmission of multi-segment
+  * packets.
+  *
+- * If the input packet is GSO'd, its mbuf refcnt reduces by 1. Therefore,
+- * when all GSO segments are freed, the input packet is freed automatically.
++ * If the input packet is GSO'd, all the indirect segments are attached to the
++ * input packet.
++ *
++ * rte_gso_segment() will not free the input packet no matter whether it is
++ * GSO'd or not, the application should free it after calling rte_gso_segment().
+  *
+  * If the memory space in pkts_out or MBUF pools is insufficient, this
+  * function fails, and it returns (-1) * errno. Otherwise, GSO succeeds,
+@@ -109,6 +112,7 @@ struct rte_gso_ctx {
+  *
+  * @return
+  *  - The number of GSO segments filled in pkts_out on success.
++ *  - Return 0 if it does not need to be GSO'd.
+  *  - Return -ENOMEM if run out of memory in MBUF pools.
+  *  - Return -EINVAL for invalid parameters.
+  */
+-- 
+2.17.1
+

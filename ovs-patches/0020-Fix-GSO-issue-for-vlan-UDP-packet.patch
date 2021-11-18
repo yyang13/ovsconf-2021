@@ -1,0 +1,86 @@
+From 30ae2c866c6db12cd1d2a069813610425a622a27 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 27 Sep 2020 23:54:18 -0400
+Subject: [PATCH 20/47] Fix GSO issue for vlan UDP packet
+
+Note: old code just considers VXLAN case, also
+doesn't consider vlan header.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 36 +++++++++++++++++++++++++-----------
+ 1 file changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index e9afc6af1..7d19deeb2 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2433,7 +2433,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             return true;
+         }
+ 
+-        /* VXLAN GSO can be done here */
++        /* Prepare VXLAN & VLAN UDP GSO here */
+         if ((mbuf->ol_flags & PKT_TX_UDP_SEG) ||
+             (mbuf->pkt_len > (tso_segsz + mbuf->outer_l2_len
+                                   + mbuf->outer_l3_len + mbuf->l2_len))) {
+@@ -2443,6 +2443,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             if ((mbuf->ol_flags & PKT_TX_L4_MASK) == PKT_TX_UDP_CKSUM) {
+                 void *l3_hdr, *l4_hdr;
+                 struct rte_udp_hdr *udp_hdr;
++                uint32_t inner_l2_len = mbuf->l2_len;
++                uint16_t eth_type;
+ 
+                 /* PKT_TX_UDP_CKSUM must be cleaned for GSO because
+                  * udp checksum only can be caculated by software for
+@@ -2450,14 +2452,26 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                  */
+                 mbuf->ol_flags &= ~PKT_TX_UDP_CKSUM;
+ 
+-                eth_hdr = (struct rte_ether_hdr *)
+-                    ((uint8_t *)eth_hdr + mbuf->outer_l2_len +
+-                               mbuf->outer_l3_len +
+-                               sizeof(struct udp_header) +
+-                               sizeof(struct vxlanhdr));
+-                l3_hdr = (uint8_t *)eth_hdr + mbuf->l2_len -
+-                         sizeof(struct udp_header) -
+-                         sizeof(struct vxlanhdr);
++                if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
++                    uint32_t inner_l2_offset = mbuf->outer_l2_len +
++                                               mbuf->outer_l3_len +
++                                               sizeof(struct udp_header) +
++                                               sizeof(struct vxlanhdr);
++                    inner_l2_len -= sizeof(struct udp_header) +
++                                    sizeof(struct vxlanhdr);
++                    eth_hdr = (struct rte_ether_hdr *)
++                                  ((uint8_t *)eth_hdr + inner_l2_offset);
++                }
++
++                eth_type = eth_hdr->ether_type;
++                if (eth_type_vlan((OVS_FORCE ovs_be16)eth_type)) {
++                    struct rte_vlan_hdr *vlan_hdr =
++                        (struct rte_vlan_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++
++                    eth_type = vlan_hdr->eth_proto;
++                }
++
++                l3_hdr = (uint8_t *)eth_hdr + inner_l2_len;
+                 l4_hdr = (uint8_t *)l3_hdr + mbuf->l3_len;
+                 ip_hdr = (struct rte_ipv4_hdr *)l3_hdr;
+                 ip_hdr->hdr_checksum = 0;
+@@ -2465,10 +2479,10 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                 /* Don't touch UDP checksum if it is ip fragment */
+                 if (!rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
+                     udp_hdr = (struct rte_udp_hdr *)l4_hdr;
++                    /* Note: udp cksum must be zeroed on calculating it */
+                     udp_hdr->dgram_cksum = 0;
+                     udp_hdr->dgram_cksum =
+-                        get_udptcp_checksum(l3_hdr, l4_hdr,
+-                                            eth_hdr->ether_type);
++                        get_udptcp_checksum(l3_hdr, l4_hdr, eth_type);
+                 }
+             }
+ 
+-- 
+2.17.1
+

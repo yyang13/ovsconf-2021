@@ -1,0 +1,113 @@
+From 73a8af423273294c71731d2c8128ee6715ca6b06 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 24 Dec 2020 03:29:54 -0500
+Subject: [PATCH 33/47] Fix IPv6 fragment support issue
+
+Note: for IPv6 fragment, l3_len must includes fragment extension
+header, so l3_len will be IPv6 base header len plus fragment
+extension header len, it is 40 plus 8.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 32 ++++++++++++++++++++++++++------
+ lib/packets.h     |  1 +
+ 2 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 3e568fe74..1db82291d 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2229,7 +2229,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+     if ((mbuf->outer_l2_len != 0) && (mbuf->outer_l3_len != 0) &&
+         ((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
+         (mbuf->l2_len >= UDP_VXLAN_ETH_HDR_SIZE)) {
+-        bool is_v4_frag = true;
++        bool is_frag = true;
+ 
+         mbuf->outer_l2_len = 0;
+         mbuf->outer_l3_len = 0;
+@@ -2243,13 +2243,22 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             ip_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip_hdr->next_proto_id;
+             if (!rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
+-                is_v4_frag = false;
++                is_frag = false;
+             }
+-        } else if (mbuf->l3_len == IPV6_HEADER_LEN) {
++        } else if ((mbuf->l3_len == IPV6_HEADER_LEN) ||
++                  (mbuf->l3_len == (IPV6_HEADER_LEN + IPV6_FRAG_HEADER_LEN))) {
+             /* Note: no IP checksum for IPv6 */
+             mbuf->ol_flags |= PKT_TX_IPV6;
+             ip6_hdr = (struct rte_ipv6_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
++            if (l4_proto == IPPROTO_FRAGMENT) {
++                struct ovs_16aligned_ip6_frag *frag_hdr
++                    = ALIGNED_CAST(struct ovs_16aligned_ip6_frag *,
++                                   ip6_hdr + 1);
++                l4_proto = frag_hdr->ip6f_nxt;
++            } else {
++                is_frag = false;
++            }
+         }
+ 
+         if (l4_proto == IPPROTO_TCP) {
+@@ -2260,7 +2269,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         } else if (l4_proto == IPPROTO_UDP) {
+             if (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN)) {
+                 mbuf->ol_flags |= PKT_TX_UDP_SEG;
+-                if (!is_v4_frag) {
++                if (!is_frag) {
+                     mbuf->ol_flags |= PKT_TX_UDP_CKSUM;
+                 }
+             }
+@@ -2293,7 +2302,9 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                                      + mbuf->outer_l3_len + mbuf->l2_len))  {
+             mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+             if ((mbuf->ol_flags & PKT_TX_IPV4) &&
+-                (mbuf->outer_l3_len == IPV6_HEADER_LEN)) {
++                ((mbuf->outer_l3_len == IPV6_HEADER_LEN) ||
++                 (mbuf->outer_l3_len ==
++                     (IPV6_HEADER_LEN + IPV6_FRAG_HEADER_LEN)))) {
+                 dp_packet_hwol_reset_tx_ipv4(pkt);
+                 dp_packet_hwol_set_tx_ipv6(pkt);
+             } else if ((mbuf->ol_flags & PKT_TX_IPV6) &&
+@@ -2319,7 +2330,9 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             mbuf->ol_flags |= PKT_TX_OUTER_IPV4;
+ 
+             udp_hdr = (struct rte_udp_hdr *)(ip_hdr + DPDK_RTE_HDR_OFFSET);
+-        } else if (mbuf->outer_l3_len == IPV6_HEADER_LEN) {
++        } else if ((mbuf->outer_l3_len == IPV6_HEADER_LEN) ||
++                   (mbuf->outer_l3_len ==
++                       (IPV6_HEADER_LEN + IPV6_FRAG_HEADER_LEN))) {
+             ip6_hdr = (struct rte_ipv6_hdr *)((char *) eth_hdr
+                                                   + mbuf->outer_l2_len);
+             /* no IP checksum for outer IPv6 */
+@@ -3055,6 +3068,13 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+             ((char *)eth_hdr + l2_len);
+         l3_len = IPV6_HEADER_LEN;
+         *l4_proto = ipv6_hdr->proto;
++        if (*l4_proto == IPPROTO_FRAGMENT) {
++            struct ovs_16aligned_ip6_frag *frag_hdr
++                = ALIGNED_CAST(struct ovs_16aligned_ip6_frag *, ipv6_hdr + 1);
++            *is_frag = 1;
++            l3_len += sizeof(*frag_hdr);
++            *l4_proto = frag_hdr->ip6f_nxt;
++        }
+         if (offset == 0) {
+             dp_packet_hwol_set_tx_outer_ipv6(pkt);
+             mbuf->packet_type |= RTE_PTYPE_L3_IPV6;
+diff --git a/lib/packets.h b/lib/packets.h
+index 395bc869e..097bcf068 100644
+--- a/lib/packets.h
++++ b/lib/packets.h
+@@ -985,6 +985,7 @@ struct ovs_16aligned_ip6_hdr {
+     union ovs_16aligned_in6_addr ip6_dst;
+ };
+ 
++#define IPV6_FRAG_HEADER_LEN 8
+ /* Like struct in6_frag, but whereas that struct requires 32-bit alignment,
+  * this one only requires 16-bit alignment. */
+ struct ovs_16aligned_ip6_frag {
+-- 
+2.17.1
+

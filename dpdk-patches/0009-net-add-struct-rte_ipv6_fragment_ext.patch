@@ -1,0 +1,33 @@
+From d57c2996ec8862e2ff7e7da6cbca3bf5aa750581 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Fri, 15 Jan 2021 02:22:02 -0500
+Subject: [PATCH 09/19] net: add struct rte_ipv6_fragment_ext
+
+Note: IPv6 UDP GRO depends on this.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/librte_net/rte_ip.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/lib/librte_net/rte_ip.h b/lib/librte_net/rte_ip.h
+index d34c0611f0..a7d8cb315f 100644
+--- a/lib/librte_net/rte_ip.h
++++ b/lib/librte_net/rte_ip.h
+@@ -43,6 +43,13 @@ struct rte_ipv4_hdr {
+ 	rte_be32_t dst_addr;		/**< destination address */
+ } __attribute__((__packed__));
+ 
++struct rte_ipv6_fragment_ext {
++	uint8_t next_header;	/**< Next header type */
++	uint8_t reserved;	/**< Reserved */
++	rte_be16_t frag_data;	/**< All fragmentation data */
++	rte_be32_t id;		/**< Packet ID */
++} __rte_packed;
++
+ /** Create IPv4 address */
+ #define RTE_IPV4(a, b, c, d) ((uint32_t)(((a) & 0xff) << 24) | \
+ 					   (((b) & 0xff) << 16) | \
+-- 
+2.17.1
+

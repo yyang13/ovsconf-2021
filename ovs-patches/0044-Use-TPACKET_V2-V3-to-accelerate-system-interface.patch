@@ -1,0 +1,1492 @@
+From 9cfc0ba2a960526026ec6c4200e11f6fff09317b Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 13 Apr 2020 01:44:04 -0500
+Subject: [PATCH 44/47] Use TPACKET_V2/V3 to accelerate system interface
+
+We can avoid high system call overhead by using TPACKET_V2/V3
+and using DPDK-like poll to receive and send packets (Note: send
+still needs to call sendto to trigger final packet transmission).
+
+From Linux kernel 3.10 on, TPACKET_V2 & V3 has been supported,
+so all the Linux kernels current OVS supports can run
+TPACKET_V2 & V3 without any problem.
+
+TPACKET_V2 & V3 can support TSO, but its performance isn't good
+because of TPACKET_V3 kernel implementation issue, TPACKET_V2 is
+very good in case of TSO although it is worse than TPACKET_V3 in
+non-TSO case.
+
+In case of DPDK, TPACKET_V2 & V3 also used rte_mbuf to avoid a
+copy, this can improve performance when traffic is across compute
+nodes.
+
+In addition, TPACKET_V3 will result in bigger delay. UFO can't
+be supported for both TPACKET_V2 and TPACKET_V3 because kernel
+doesn't support it on using virtio_net_hdr.
+
+A new other_config option userspace-use-tpacket is added, and it is
+set to true by default, if somebody still want to use old recvmmsg &
+sendmmsg, he/she can use it by setting userspace-use-tpacket to false.
+
+A user can grep "tpacket" from ovs-vswitchd to get to know which one
+is being used, TPACKET_V3, TPACKET_V2 or old  recvmmsg & sendmmsg.
+
+Note: how much performance improvement is up to your platform, kernel
+version, some platforms can see huge improvement, some ones aren't so
+noticeable, but for TSO case, you can see huge improvement no matter
+it is low end system or high end system or any kernel version,this
+attributes to TPACKET_V2.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+Co-authored-by: William Tu <u9012063@gmail.com>
+Signed-off-by: William Tu <u9012063@gmail.com>
+---
+ acinclude.m4                     |  12 +
+ configure.ac                     |   1 +
+ include/sparse/linux/if_packet.h | 111 +++++
+ lib/automake.mk                  |   2 +
+ lib/netdev-dpdk.c                | 149 +++++++
+ lib/netdev-dpdk.h                |  12 +-
+ lib/netdev-linux-private.h       |  33 ++
+ lib/netdev-linux.c               | 690 +++++++++++++++++++++++++++++--
+ lib/userspace-use-tpacket.c      |  65 +++
+ lib/userspace-use-tpacket.h      |  23 ++
+ vswitchd/bridge.c                |   2 +
+ 11 files changed, 1066 insertions(+), 34 deletions(-)
+ create mode 100644 lib/userspace-use-tpacket.c
+ create mode 100644 lib/userspace-use-tpacket.h
+
+diff --git a/acinclude.m4 b/acinclude.m4
+index 857067a88..4258158c4 100644
+--- a/acinclude.m4
++++ b/acinclude.m4
+@@ -1162,6 +1162,18 @@ AC_DEFUN([OVS_CHECK_IF_DL],
+       AC_SEARCH_LIBS([pcap_open_live], [pcap])
+    fi])
+ 
++dnl OVS_CHECK_LINUX_TPACKET
++dnl
++dnl Configure Linux TPACKET.
++AC_DEFUN([OVS_CHECK_LINUX_TPACKET], [
++  AC_COMPILE_IFELSE([
++    AC_LANG_PROGRAM([#include <linux/if_packet.h>], [
++        struct tpacket3_hdr x =  { 0 };
++    ])],
++    [AC_DEFINE([HAVE_TPACKET_V3], [1],
++    [Define to 1 if struct tpacket3_hdr is available.])])
++])
++
+ dnl Checks for buggy strtok_r.
+ dnl
+ dnl Some versions of glibc 2.7 has a bug in strtok_r when compiling
+diff --git a/configure.ac b/configure.ac
+index b1a486a09..68e7515a3 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -89,6 +89,7 @@ OVS_CHECK_VISUAL_STUDIO_DDK
+ OVS_CHECK_COVERAGE
+ OVS_CHECK_NDEBUG
+ OVS_CHECK_NETLINK
++OVS_CHECK_LINUX_TPACKET
+ OVS_CHECK_OPENSSL
+ OVS_CHECK_LIBCAPNG
+ OVS_CHECK_LOGDIR
+diff --git a/include/sparse/linux/if_packet.h b/include/sparse/linux/if_packet.h
+index 5ff6d4730..0ac3fcefc 100644
+--- a/include/sparse/linux/if_packet.h
++++ b/include/sparse/linux/if_packet.h
+@@ -5,6 +5,7 @@
+ #error "Use this header only with sparse.  It is not a correct implementation."
+ #endif
+ 
++#include <openvswitch/types.h>
+ #include_next <linux/if_packet.h>
+ 
+ /* Fix endianness of 'spkt_protocol' and 'sll_protocol' members. */
+@@ -27,4 +28,114 @@ struct sockaddr_ll {
+         unsigned char   sll_addr[8];
+ };
+ 
++/* Packet types */
++#define PACKET_HOST                     0 /* To us                */
++#define PACKET_OTHERHOST                3 /* To someone else 	*/
++#define PACKET_LOOPBACK                 5 /* MC/BRD frame looped back */
++
++/* Packet socket options */
++#define PACKET_RX_RING                  5
++#define PACKET_VERSION                 10
++#define PACKET_TX_RING                 13
++#define PACKET_VNET_HDR                15
++
++/* Rx ring - header status */
++#define TP_STATUS_KERNEL                0
++#define TP_STATUS_USER            (1 << 0)
++#define TP_STATUS_VLAN_VALID      (1 << 4) /* auxdata has valid tp_vlan_tci */
++#define TP_STATUS_VLAN_TPID_VALID (1 << 6) /* auxdata has valid tp_vlan_tpid */
++
++/* Tx ring - header status */
++#define TP_STATUS_SEND_REQUEST    (1 << 0)
++#define TP_STATUS_SENDING         (1 << 1)
++
++#define tpacket_hdr rpl_tpacket_hdr
++struct tpacket_hdr {
++    unsigned long tp_status;
++    unsigned int tp_len;
++    unsigned int tp_snaplen;
++    unsigned short tp_mac;
++    unsigned short tp_net;
++    unsigned int tp_sec;
++    unsigned int tp_usec;
++};
++
++#define TPACKET_ALIGNMENT 16
++#define TPACKET_ALIGN(x) (((x)+TPACKET_ALIGNMENT-1)&~(TPACKET_ALIGNMENT-1))
++
++#define tpacket_hdr_variant1 rpl_tpacket_hdr_variant1
++struct tpacket_hdr_variant1 {
++    uint32_t tp_rxhash;
++    uint32_t tp_vlan_tci;
++    uint16_t tp_vlan_tpid;
++    uint16_t tp_padding;
++};
++
++#define tpacket3_hdr rpl_tpacket3_hdr
++struct tpacket3_hdr {
++    uint32_t  tp_next_offset;
++    uint32_t  tp_sec;
++    uint32_t  tp_nsec;
++    uint32_t  tp_snaplen;
++    uint32_t  tp_len;
++    uint32_t  tp_status;
++    uint16_t  tp_mac;
++    uint16_t  tp_net;
++    /* pkt_hdr variants */
++    union {
++        struct tpacket_hdr_variant1 hv1;
++    };
++    uint8_t  tp_padding[8];
++};
++
++#define tpacket_bd_ts rpl_tpacket_bd_ts
++struct tpacket_bd_ts {
++    unsigned int ts_sec;
++    union {
++        unsigned int ts_usec;
++        unsigned int ts_nsec;
++    };
++};
++
++#define tpacket_hdr_v1 rpl_tpacket_hdr_v1
++struct tpacket_hdr_v1 {
++    uint32_t block_status;
++    uint32_t num_pkts;
++    uint32_t offset_to_first_pkt;
++    uint32_t blk_len;
++    uint64_t __attribute__((aligned(8))) seq_num;
++    struct tpacket_bd_ts ts_first_pkt, ts_last_pkt;
++};
++
++#define tpacket_bd_header_u rpl_tpacket_bd_header_u
++union tpacket_bd_header_u {
++    struct tpacket_hdr_v1 bh1;
++};
++
++#define tpacket_block_desc rpl_tpacket_block_desc
++struct tpacket_block_desc {
++    uint32_t version;
++    uint32_t offset_to_priv;
++    union tpacket_bd_header_u hdr;
++};
++
++#define TPACKET3_HDRLEN \
++    (TPACKET_ALIGN(sizeof(struct tpacket3_hdr)) + sizeof(struct sockaddr_ll))
++
++enum rpl_tpacket_versions {
++    TPACKET_V1,
++    TPACKET_V2,
++    TPACKET_V3
++};
++
++#define tpacket_req3 rpl_tpacket_req3
++struct tpacket_req3 {
++    unsigned int tp_block_size; /* Minimal size of contiguous block */
++    unsigned int tp_block_nr; /* Number of blocks */
++    unsigned int tp_frame_size; /* Size of frame */
++    unsigned int tp_frame_nr; /* Total number of frames */
++    unsigned int tp_retire_blk_tov; /* Timeout in msecs */
++    unsigned int tp_sizeof_priv; /* Offset to private data area */
++    unsigned int tp_feature_req_word;
++};
+ #endif
+diff --git a/lib/automake.mk b/lib/automake.mk
+index f689a0c71..3ce5ee042 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -351,6 +351,8 @@ lib_libopenvswitch_la_SOURCES = \
+ 	lib/userspace-tso-segsz.h \
+ 	lib/userspace-vxlan-port.c \
+ 	lib/userspace-vxlan-port.h \
++	lib/userspace-use-tpacket.c \
++	lib/userspace-use-tpacket.h \
+ 	lib/util.c \
+ 	lib/util.h \
+ 	lib/uuid.c \
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 0b30c2647..f4b74614a 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -917,6 +917,155 @@ netdev_dpdk_mempool_configure(struct netdev_dpdk *dev)
+     return ret;
+ }
+ 
++static struct rte_mbuf *
++dpdk_pktmbuf_alloc(struct rte_mempool *mp, uint32_t data_len);
++
++struct dpdk_mp *
++dpdk_mp_create_for_nondpdk_ports(struct dpdk_mp **dpdk_mpp,
++                                 const char *netdev_name,
++                                 int mtu)
++{
++    char mp_name[RTE_MEMPOOL_NAMESIZE];
++    int socket_id = 0;
++    uint32_t n_mbufs = 0;
++    uint32_t mbuf_size = 0;
++    uint32_t aligned_mbuf_size = 0;
++    uint32_t mbuf_priv_data_len = 0;
++    uint32_t pkt_size = 0;
++    uint32_t hash = hash_string(netdev_name, 0);
++    struct dpdk_mp *dmp = NULL;
++    int ret;
++
++    VLOG_INFO("create mempool for interface %s", netdev_name);
++    mtu = FRAME_LEN_TO_MTU(dpdk_buf_size(mtu));
++    dmp = dpdk_rte_mzalloc(sizeof *dmp);
++    if (!dmp) {
++        VLOG_INFO("create mempool for interface %s: return NULL", netdev_name);
++        *dpdk_mpp = NULL;
++        return NULL;
++    }
++    dmp->socket_id = socket_id;
++    dmp->mtu = mtu;
++    dmp->refcount = 1;
++
++    /* Get the size of each mbuf, based on the MTU */
++    mbuf_size = MTU_TO_FRAME_LEN(mtu);
++
++    n_mbufs = 4096;
++
++    do {
++        /* Full DPDK memory pool name must be unique and cannot be
++         * longer than RTE_MEMPOOL_NAMESIZE. Note that for the shared
++         * mempool case this can result in one device using a mempool
++         * which references a different device in it's name. However as
++         * mempool names are hashed, the device name will not be readable
++         * so this is not an issue for tasks such as debugging.
++         */
++        ret = snprintf(mp_name, RTE_MEMPOOL_NAMESIZE,
++                       "ovs%08x%02d%05d%07u",
++                        hash, socket_id, mtu, n_mbufs);
++        if (ret < 0 || ret >= RTE_MEMPOOL_NAMESIZE) {
++            VLOG_DBG("snprintf returned %d. "
++                     "Failed to generate a mempool name for \"%s\". "
++                     "Hash:0x%x, socket_id: %d, mtu:%d, mbufs:%u.",
++                     ret, netdev_name, hash, socket_id, mtu, n_mbufs);
++            break;
++        }
++
++        VLOG_DBG("Port %s: Requesting a mempool of %u mbufs of size %u "
++                  "on socket %d for %d Rx and %d Tx queues, "
++                  "cache line size of %u",
++                  netdev_name, n_mbufs, mbuf_size, socket_id,
++                  1, 1,
++                  RTE_CACHE_LINE_SIZE);
++
++        /* The size of the mbuf's private area (i.e. area that holds OvS'
++         * dp_packet data)*/
++        mbuf_priv_data_len = sizeof(struct dp_packet) -
++                                 sizeof(struct rte_mbuf);
++        /* The size of the entire dp_packet. */
++        pkt_size = sizeof(struct dp_packet) + mbuf_size;
++        /* mbuf size, rounded up to cacheline size. */
++        aligned_mbuf_size = ROUND_UP(pkt_size, RTE_CACHE_LINE_SIZE);
++        /* If there is a size discrepancy, add padding to mbuf_priv_data_len.
++         * This maintains mbuf size cache alignment, while also honoring RX
++         * buffer alignment in the data portion of the mbuf. If this adjustment
++         * is not made, there is a possiblity later on that for an element of
++         * the mempool, buf, buf->data_len < (buf->buf_len - buf->data_off).
++         * This is problematic in the case of multi-segment mbufs, particularly
++         * when an mbuf segment needs to be resized (when [push|popp]ing a VLAN
++         * header, for example.
++         */
++        mbuf_priv_data_len += (aligned_mbuf_size - pkt_size);
++
++        dmp->mp = rte_pktmbuf_pool_create(mp_name, n_mbufs, MP_CACHE_SZ,
++                                          mbuf_priv_data_len,
++                                          mbuf_size,
++                                          socket_id);
++
++        if (dmp->mp) {
++            VLOG_DBG("Allocated \"%s\" mempool with %u mbufs",
++                     mp_name, n_mbufs);
++            /* rte_pktmbuf_pool_create has done some initialization of the
++             * rte_mbuf part of each dp_packet, while ovs_rte_pktmbuf_init
++             * initializes some OVS specific fields of dp_packet.
++             */
++            rte_mempool_obj_iter(dmp->mp, ovs_rte_pktmbuf_init, NULL);
++            VLOG_INFO("create mempool for interface %s: dmp: %p, "
++                      "mbuf_size: %d, n_mbufs: %d",
++                      netdev_name, dmp, mbuf_size, n_mbufs);
++            *dpdk_mpp = dmp;
++            return dmp;
++        } else if (rte_errno == EEXIST) {
++            /* A mempool with the same name already exists.  We just
++             * retrieve its pointer to be returned to the caller. */
++            dmp->mp = rte_mempool_lookup(mp_name);
++            /* As the mempool create returned EEXIST we can expect the
++             * lookup has returned a valid pointer.  If for some reason
++             * that's not the case we keep track of it. */
++            VLOG_DBG("A mempool with name \"%s\" already exists at %p.",
++                     mp_name, dmp->mp);
++            VLOG_INFO("create mempool for interface %s: dmp: %p",
++                      netdev_name, dmp);
++            *dpdk_mpp = dmp;
++            return dmp;
++        } else {
++            VLOG_DBG("Failed to create mempool \"%s\" with a request of "
++                     "%u mbufs, retrying with %u mbufs",
++                     mp_name, n_mbufs, n_mbufs / 2);
++            VLOG_INFO("create mempool for interface %s: failed create",
++                      netdev_name);
++        }
++   } while (!dmp->mp && rte_errno == ENOMEM && (n_mbufs /= 2) >= MIN_NB_MBUF);
++
++    VLOG_ERR("Failed to create mempool \"%s\" with a request of %u mbufs",
++             mp_name, n_mbufs);
++    VLOG_INFO("create mempool for interface %s: failed", netdev_name);
++
++    rte_free(dmp);
++    return NULL;
++}
++
++struct dp_packet *
++dpdk_dp_packet_new_with_headroom(struct dpdk_mp *dpdk_mp, unsigned int len,
++                                 struct dp_packet **p)
++{
++    if (dpdk_mp == NULL) {
++        *p = NULL;
++    } else {
++        *p = (struct dp_packet *)dpdk_pktmbuf_alloc(dpdk_mp->mp, len);
++    }
++
++    return *p;
++}
++
++void
++dpdk_mp_free_for_nondpdk_ports(struct dpdk_mp *dpdk_mp)
++{
++    rte_mempool_free(dpdk_mp->mp);
++    rte_free(dpdk_mp);
++}
++
+ static void
+ check_link_status(struct netdev_dpdk *dev)
+ {
+diff --git a/lib/netdev-dpdk.h b/lib/netdev-dpdk.h
+index 848346cb4..54b475085 100644
+--- a/lib/netdev-dpdk.h
++++ b/lib/netdev-dpdk.h
+@@ -32,6 +32,7 @@ struct rte_flow_attr;
+ struct rte_flow_item;
+ struct rte_flow_action;
+ struct rte_flow_query_count;
++struct dpdk_mp;
+ 
+ void netdev_dpdk_register(void);
+ void free_dpdk_buf(struct dp_packet *);
+@@ -55,7 +56,16 @@ netdev_dpdk_rte_flow_query_count(struct netdev *netdev,
+                                  struct rte_flow_error *error);
+ int
+ netdev_dpdk_get_port_id(struct netdev *netdev);
+-
++struct dpdk_mp *
++dpdk_mp_create_for_nondpdk_ports(struct dpdk_mp **dpdk_mpp,
++                                 const char *netdev_name,
++                                 int mtu);
++struct dp_packet *
++dpdk_dp_packet_new_with_headroom(struct dpdk_mp *dpdk_mp,
++                                 unsigned int len,
++                                 struct dp_packet **p);
++void
++dpdk_mp_free_for_nondpdk_ports(struct dpdk_mp *dpdk_mp);
+ #else
+ 
+ static inline void
+diff --git a/lib/netdev-linux-private.h b/lib/netdev-linux-private.h
+index fbedfd96a..a7a2d4294 100644
+--- a/lib/netdev-linux-private.h
++++ b/lib/netdev-linux-private.h
+@@ -20,6 +20,7 @@
+ #include <linux/filter.h>
+ #include <linux/gen_stats.h>
+ #include <linux/if_ether.h>
++#include <linux/if_packet.h>
+ #include <linux/if_tun.h>
+ #include <linux/types.h>
+ #include <linux/ethtool.h>
+@@ -37,16 +38,43 @@
+ #include "timer.h"
+ 
+ struct netdev;
++#ifdef DPDK_NETDEV
++struct dpdk_mp;
++#endif
+ 
+ /* The maximum packet length is 16 bits */
+ #define LINUX_RXQ_TSO_MAX_LEN 65535
+ 
++#ifdef HAVE_TPACKET_V3
++struct tpacket_ring {
++    int sockfd;                  /* Raw socket fd */
++    struct iovec *rd;            /* Ring buffer descriptors */
++    uint8_t *mm_space;           /* Mmap base address */
++    size_t mm_len;               /* Total mmap length */
++    size_t rd_len;               /* Total ring buffer descriptors length */
++    int type;                    /* Ring type: rx or tx */
++    int rd_num;                  /* Number of ring buffer descriptor */
++    int flen;                    /* Block size */
++    union {
++        struct tpacket_req  req; /* TPACKET_V1/2 req */
++        struct tpacket_req3 req3;/* TPACKET_V3 req */
++    };
++    uint32_t block_num;          /* Current block number */
++    uint32_t frame_num;          /* Current frame number */
++    uint32_t frame_num_in_block; /* Frame number in current block */
++    void * ppd;                  /* Packet pointer in current block */
++};
++#endif /* HAVE_TPACKET_V3 */
++
+ struct netdev_rxq_linux {
+     struct netdev_rxq up;
+     bool is_tap;
+     int fd;
+     struct dp_packet *aux_bufs[NETDEV_MAX_BURST]; /* Preallocated TSO
+                                                      packets. */
++#ifdef DPDK_NETDEV
++    struct dpdk_mp *dpdk_mp;
++#endif
+ };
+ 
+ int netdev_linux_construct(struct netdev *);
+@@ -106,6 +134,11 @@ struct netdev_linux {
+ 
+     int numa_id;                /* NUMA node id. */
+ 
++#ifdef HAVE_TPACKET_V3
++    struct tpacket_ring *tp_rx_ring;
++    struct tpacket_ring *tp_tx_ring;
++#endif
++
+ #ifdef HAVE_AF_XDP
+     /* AF_XDP information. */
+     struct xsk_socket_info **xsks;
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 92b32818a..87d5beeea 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -38,6 +38,9 @@
+ #include <linux/sockios.h>
+ #include <linux/virtio_net.h>
+ #include <sys/ioctl.h>
++#ifdef HAVE_TPACKET_V3
++#include <sys/mman.h>
++#endif
+ #include <sys/socket.h>
+ #include <sys/uio.h>
+ #include <sys/utsname.h>
+@@ -82,6 +85,7 @@
+ #include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
+ #include "userspace-tso-segsz.h"
++#include "userspace-use-tpacket.h"
+ #include "util.h"
+ 
+ VLOG_DEFINE_THIS_MODULE(netdev_linux);
+@@ -1004,6 +1008,7 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+     struct netns_knob netns_knob;
+     bool is_tap_in_netns = false;
+     int error;
++    bool tso = userspace_tso_enabled();
+ 
+     if (is_tap_netdev(netdev_) && (netdev_->netns != NULL)) {
+         netdev->netns = xstrdup(netdev_->netns);
+@@ -1036,7 +1041,7 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+     /* Create tap device. */
+     get_flags(&netdev->up, &netdev->ifi_flags, false);
+     ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+-    if (userspace_tso_enabled()) {
++    if (tso) {
+         ifr.ifr_flags |= IFF_VNET_HDR;
+     }
+ 
+@@ -1061,13 +1066,14 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+         goto error_close;
+     }
+ 
+-    if (userspace_tso_enabled()) {
++    if (tso) {
+         /* Old kernels don't support TUNSETOFFLOAD. If TUNSETOFFLOAD is
+          * available, it will return EINVAL when a flag is unknown.
+          * Therefore, try enabling offload with no flags to check
+          * if TUNSETOFFLOAD support is available or not. */
+         if (ioctl(netdev->tap_fd, TUNSETOFFLOAD, 0) == 0 || errno != EINVAL) {
+-            unsigned long oflags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
++            unsigned long oflags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6
++                                       | TUN_F_UFO;
+ 
+             if (ioctl(netdev->tap_fd, TUNSETOFFLOAD, oflags) == -1) {
+                 VLOG_WARN("%s: enabling tap offloading failed: %s", name,
+@@ -1133,6 +1139,198 @@ netdev_linux_rxq_alloc(void)
+     return &rx->up;
+ }
+ 
++typedef int (*tpacket_batch_recv_func_t) (struct netdev_rxq_linux *, bool, int,
++                                          struct dp_packet_batch *);
++typedef int (*tpacket_batch_send_func_t) (int, int, struct netdev *, bool, int,
++                                          struct dp_packet_batch *);
++
++static tpacket_batch_recv_func_t netdev_linux_batch_recv;
++static tpacket_batch_send_func_t netdev_linux_batch_send;
++
++static int
++netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, bool tso,
++                                 int mtu, struct dp_packet_batch *batch);
++static int
++netdev_linux_sock_batch_send(int sock, int ifindex,
++                             struct netdev *netdev_ OVS_UNUSED,
++                             bool tso, int mtu,
++                             struct dp_packet_batch *batch);
++
++#ifdef HAVE_TPACKET_V3
++static int
++netdev_linux_batch_recv_tpacket_v3(struct netdev_rxq_linux *rx, bool tso,
++                                   int mtu OVS_UNUSED,
++                                   struct dp_packet_batch *batch);
++static int
++netdev_linux_batch_recv_tpacket_v2(struct netdev_rxq_linux *rx, bool tso,
++                                   int mtu OVS_UNUSED,
++                                   struct dp_packet_batch *batch);
++static int
++netdev_linux_tpacket_batch_send_v3(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
++                                   struct netdev *netdev_, bool tso, int mtu,
++                                   struct dp_packet_batch *batch);
++static int
++netdev_linux_tpacket_batch_send_v2(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
++                                   struct netdev *netdev_, bool tso, int mtu,
++                                   struct dp_packet_batch *batch);
++static inline struct tpacket3_hdr *
++tpacket_get_next_frame_v3(struct tpacket_ring *ring, uint32_t frame_num)
++{
++    uint8_t *f0 = ring->rd[0].iov_base;
++
++    return ALIGNED_CAST(struct tpacket3_hdr *,
++               f0 + (frame_num * ring->req3.tp_frame_size));
++}
++
++static inline struct tpacket2_hdr *
++tpacket_get_next_frame_v2(struct tpacket_ring *ring, uint32_t frame_num)
++{
++    return ALIGNED_CAST(struct tpacket2_hdr *,
++               ring->rd[frame_num].iov_base);
++}
++
++/* For TPACKET_V1&V2, ring->rd_num is tp_frame_nr, ring->flen is tp_frame_size
++ */
++static inline void
++tpacket_v1_v2_fill_ring(struct tpacket_ring *ring, unsigned int blocks)
++{
++    if (userspace_tso_enabled()) {
++        /* For TX ring, the whole packet must be in one frame
++         * so tp_frame_size must big enough to accommodate
++         * 64K packet, tpacket3_hdr will occupy some bytes,
++         * the final frame size is 64K + 4K = 68K.
++         */
++        ring->req.tp_frame_size = (getpagesize() << 4) + getpagesize();
++        ring->req.tp_block_size = ring->req.tp_frame_size;
++    } else {
++        ring->req.tp_block_size = getpagesize() << 2;
++        ring->req.tp_frame_size = TPACKET_ALIGNMENT << 7;
++    }
++    ring->req.tp_block_nr = blocks;
++
++    ring->req.tp_frame_nr = ring->req.tp_block_size /
++                            ring->req.tp_frame_size *
++                            ring->req.tp_block_nr;
++
++    ring->mm_len = ring->req.tp_block_size * ring->req.tp_block_nr;
++    ring->rd_num = ring->req.tp_frame_nr;
++    ring->flen = ring->req.tp_frame_size;
++}
++
++static inline void
++tpacket_fill_ring(struct tpacket_ring *ring, unsigned int blocks, int type)
++{
++    if (type == PACKET_RX_RING) {
++        ring->req3.tp_retire_blk_tov = 1;
++        ring->req3.tp_sizeof_priv = 0;
++        ring->req3.tp_feature_req_word = 0;
++    }
++
++    if (userspace_tso_enabled()) {
++        /* For TX ring, the whole packet must be in one frame
++         * so tp_frame_size must big enough to accommodate
++         * 64K packet, tpacket3_hdr will occupy some bytes,
++         * the final frame size is 64K + 4K = 68K.
++         */
++        ring->req3.tp_frame_size = (getpagesize() << 4) + getpagesize();
++        ring->req3.tp_block_size = ring->req3.tp_frame_size;
++    } else {
++        ring->req3.tp_block_size = getpagesize() << 2;
++        ring->req3.tp_frame_size = TPACKET_ALIGNMENT << 7;
++    }
++
++    ring->req3.tp_block_nr = blocks;
++
++    ring->req3.tp_frame_nr = ring->req3.tp_block_size /
++                             ring->req3.tp_frame_size *
++                             ring->req3.tp_block_nr;
++
++    ring->mm_len = ring->req3.tp_block_size * ring->req3.tp_block_nr;
++    ring->rd_num = ring->req3.tp_block_nr;
++    ring->flen = ring->req3.tp_block_size;
++}
++
++static inline int
++tpacket_set_packet_loss_discard(int sock)
++{
++    int discard = 1;
++
++    return setsockopt(sock, SOL_PACKET, PACKET_LOSS, (void *) &discard,
++                      sizeof(discard));
++}
++
++static int
++tpacket_setup_ring(int sock, struct tpacket_ring *ring, int type)
++{
++    int ret = 0;
++    unsigned int blocks;
++    bool tso = userspace_tso_enabled();
++
++    if (tso) {
++        blocks = 128;
++    } else {
++        blocks = 256;
++    }
++    ring->type = type;
++
++    if (!tso) {
++        /* Use TPACKET_V3 for non-TSO case */
++        tpacket_fill_ring(ring, blocks, type);
++        ret = setsockopt(sock, SOL_PACKET, type, &ring->req3,
++                         sizeof(ring->req3));
++    } else {
++        /* Use TPACKET_V2 for TSO case */
++        if (type == PACKET_TX_RING) {
++            tpacket_set_packet_loss_discard(sock);
++        }
++        tpacket_v1_v2_fill_ring(ring, blocks);
++        ret = setsockopt(sock, SOL_PACKET, type, &ring->req,
++                         sizeof(ring->req));
++    }
++
++    if (ret == -1) {
++        return -1;
++    }
++
++    ring->rd_len = ring->rd_num * sizeof(*ring->rd);
++    ring->rd = xmalloc(ring->rd_len);
++    if (ring->rd == NULL) {
++        return -1;
++    }
++
++    return 0;
++}
++
++static inline int
++tpacket_mmap_rx_tx_ring(int sock, struct tpacket_ring *rx_ring,
++                struct tpacket_ring *tx_ring)
++{
++    int i;
++
++    rx_ring->mm_space = mmap(NULL, rx_ring->mm_len + tx_ring->mm_len,
++                          PROT_READ | PROT_WRITE,
++                          MAP_SHARED | MAP_LOCKED | MAP_POPULATE, sock, 0);
++    if (rx_ring->mm_space == MAP_FAILED) {
++        return -1;
++    }
++
++    memset(rx_ring->rd, 0, rx_ring->rd_len);
++    for (i = 0; i < rx_ring->rd_num; ++i) {
++        rx_ring->rd[i].iov_base = rx_ring->mm_space + (i * rx_ring->flen);
++        rx_ring->rd[i].iov_len = rx_ring->flen;
++    }
++
++    tx_ring->mm_space = rx_ring->mm_space + rx_ring->mm_len;
++    memset(tx_ring->rd, 0, tx_ring->rd_len);
++    for (i = 0; i < tx_ring->rd_num; ++i) {
++        tx_ring->rd[i].iov_base = tx_ring->mm_space + (i * tx_ring->flen);
++        tx_ring->rd[i].iov_len = tx_ring->flen;
++    }
++
++    return 0;
++}
++#endif
++
+ static int
+ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+ {
+@@ -1148,6 +1346,7 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+     } else {
+         struct sockaddr_ll sll;
+         int ifindex, val;
++
+         /* Result of tcpdump -dd inbound */
+         static const struct sock_filter filt[] = {
+             { 0x28, 0, 0, 0xfffff004 }, /* ldh [0] */
+@@ -1170,9 +1369,13 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+          */
+         uint32_t sock_buf_size = userspace_get_sock_buf_size();
+         uint32_t sock_opt_len = sizeof(sock_buf_size);
++        bool tso = userspace_tso_enabled();
++#ifdef HAVE_TPACKET_V3
++        bool use_tpacket = userspace_use_tpacket();
++#endif
+ 
+         /* Create file descriptor. */
+-        rx->fd = socket(PF_PACKET, SOCK_RAW, 0);
++        rx->fd = socket(PF_PACKET, SOCK_RAW, (OVS_FORCE int) htons(ETH_P_ALL));
+         if (rx->fd < 0) {
+             error = errno;
+             VLOG_ERR("failed to create raw socket (%s)", ovs_strerror(error));
+@@ -1187,7 +1390,7 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+             goto error;
+         }
+ 
+-        if (userspace_tso_enabled()
++        if (tso
+             && setsockopt(rx->fd, SOL_PACKET, PACKET_VNET_HDR, &val,
+                           sizeof val)) {
+             error = errno;
+@@ -1196,6 +1399,76 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+             goto error;
+         }
+ 
++#ifdef HAVE_TPACKET_V3
++        if (use_tpacket) {
++            static int ver = TPACKET_V3;
++            if (!tso) {
++                ver = TPACKET_V3;
++                netdev_linux_batch_recv =
++                    &netdev_linux_batch_recv_tpacket_v3;
++                netdev_linux_batch_send =
++                    &netdev_linux_tpacket_batch_send_v3;
++            } else {
++                ver = TPACKET_V2;
++                netdev_linux_batch_recv =
++                    &netdev_linux_batch_recv_tpacket_v2;
++                netdev_linux_batch_send =
++                    &netdev_linux_tpacket_batch_send_v2;
++            }
++
++            /* TPACKET_V3 ring setup must be after setsockopt
++             * PACKET_VNET_HDR because PACKET_VNET_HDR will return error
++             * (EBUSY) if ring is set up
++             */
++            error = setsockopt(rx->fd, SOL_PACKET, PACKET_VERSION, &ver,
++                               sizeof(ver));
++            if (error != 0) {
++                error = errno;
++                VLOG_ERR("%s: failed to set tpacket version (%s)",
++                         netdev_get_name(netdev_), ovs_strerror(error));
++                goto error;
++            }
++            netdev->tp_rx_ring = xzalloc(sizeof(struct tpacket_ring));
++            netdev->tp_tx_ring = xzalloc(sizeof(struct tpacket_ring));
++            netdev->tp_rx_ring->sockfd = rx->fd;
++            netdev->tp_tx_ring->sockfd = rx->fd;
++            error = tpacket_setup_ring(rx->fd, netdev->tp_rx_ring,
++                                       PACKET_RX_RING);
++            if (error != 0) {
++                error = errno;
++                VLOG_ERR("%s: failed to set tpacket rx ring (%s)",
++                         netdev_get_name(netdev_), ovs_strerror(error));
++                goto error;
++            }
++            error = tpacket_setup_ring(rx->fd, netdev->tp_tx_ring,
++                                       PACKET_TX_RING);
++            if (error != 0) {
++                error = errno;
++                VLOG_ERR("%s: failed to set tpacket tx ring (%s)",
++                         netdev_get_name(netdev_), ovs_strerror(error));
++                goto error;
++            }
++            error = tpacket_mmap_rx_tx_ring(rx->fd, netdev->tp_rx_ring,
++                                           netdev->tp_tx_ring);
++            if (error != 0) {
++                error = errno;
++                VLOG_ERR("%s: failed to mmap tpacket rx & tx ring (%s)",
++                         netdev_get_name(netdev_), ovs_strerror(error));
++                goto error;
++            }
++        } else {
++            netdev_linux_batch_recv =
++                &netdev_linux_batch_rxq_recv_sock;
++            netdev_linux_batch_send =
++                &netdev_linux_sock_batch_send;
++        }
++#else
++        netdev_linux_batch_recv =
++            &netdev_linux_batch_rxq_recv_sock;
++        netdev_linux_batch_send =
++            &netdev_linux_sock_batch_send;
++#endif
++
+         /* Set non-blocking mode. */
+         error = set_nonblocking(rx->fd);
+         if (error) {
+@@ -1211,8 +1484,15 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+         /* Bind to specific ethernet device. */
+         memset(&sll, 0, sizeof sll);
+         sll.sll_family = AF_PACKET;
++#ifdef HAVE_TPACKET_V3
++        if (use_tpacket) {
++            sll.sll_hatype = 0;
++            sll.sll_pkttype = 0;
++            sll.sll_halen = 0;
++        }
++#endif
+         sll.sll_ifindex = ifindex;
+-        sll.sll_protocol = htons(ETH_P_ALL);
++        sll.sll_protocol = (OVS_FORCE ovs_be16) htons(ETH_P_ALL);
+         if (bind(rx->fd, (struct sockaddr *) &sll, sizeof sll) < 0) {
+             error = errno;
+             VLOG_ERR("%s: failed to bind raw socket (%s)",
+@@ -1291,6 +1571,25 @@ netdev_linux_rxq_destruct(struct netdev_rxq *rxq_)
+     int i;
+ 
+     if (!rx->is_tap) {
++#ifdef HAVE_TPACKET_V3
++        if (userspace_use_tpacket()) {
++            struct netdev_linux *netdev = netdev_linux_cast(rx->up.netdev);
++
++            if (netdev->tp_rx_ring) {
++                munmap(netdev->tp_rx_ring->mm_space,
++                       2 * netdev->tp_rx_ring->mm_len);
++                free(netdev->tp_rx_ring->rd);
++                free(netdev->tp_tx_ring->rd);
++            }
++        }
++#endif
++
++#ifdef DPDK_NETDEV
++        if (rx->dpdk_mp) {
++            dpdk_mp_free_for_nondpdk_ports(rx->dpdk_mp);
++        }
++#endif
++
+         close(rx->fd);
+     }
+ 
+@@ -1307,16 +1606,25 @@ netdev_linux_rxq_dealloc(struct netdev_rxq *rxq_)
+     free(rx);
+ }
+ 
+-static ovs_be16
+-auxdata_to_vlan_tpid(const struct tpacket_auxdata *aux, bool double_tagged)
+-{
+-    if (aux->tp_status & TP_STATUS_VLAN_TPID_VALID) {
+-        return htons(aux->tp_vlan_tpid);
++static inline void
++push_vlan_to_dp_packet(uint32_t tp_status, uint16_t tp_vlan_tpid,
++                       uint16_t tp_vlan_tci, struct dp_packet *pkt)
++ {
++    struct eth_header *eth;
++    bool double_tagged;
++    ovs_be16 vlan_tpid;
++
++    eth = dp_packet_data(pkt);
++    double_tagged = eth->eth_type == htons(ETH_TYPE_VLAN_8021Q);
++
++    if (tp_status & TP_STATUS_VLAN_TPID_VALID) {
++        vlan_tpid = htons(tp_vlan_tpid);
+     } else if (double_tagged) {
+-        return htons(ETH_TYPE_VLAN_8021AD);
++        vlan_tpid = htons(ETH_TYPE_VLAN_8021AD);
+     } else {
+-        return htons(ETH_TYPE_VLAN_8021Q);
++        vlan_tpid = htons(ETH_TYPE_VLAN_8021Q);
+     }
++    eth_push_vlan(pkt, vlan_tpid, htons(tp_vlan_tci));
+ }
+ 
+ static bool
+@@ -1333,8 +1641,8 @@ auxdata_has_vlan_tci(const struct tpacket_auxdata *aux)
+  * It also used recvmmsg to reduce multiple syscalls overhead;
+  */
+ static int
+-netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, int mtu,
+-                                 struct dp_packet_batch *batch)
++netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, bool tso,
++                                 int mtu, struct dp_packet_batch *batch)
+ {
+     int iovlen;
+     size_t std_len;
+@@ -1350,7 +1658,7 @@ netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, int mtu,
+     struct dp_packet *buffers[NETDEV_MAX_BURST];
+     int i;
+ 
+-    if (userspace_tso_enabled()) {
++    if (tso) {
+         /* Use the buffer from the allocated packet below to receive MTU
+          * sized packets and an aux_buf for extra TSO data. */
+         iovlen = IOV_TSO_SIZE;
+@@ -1452,15 +1760,8 @@ netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, int mtu,
+ 
+             aux = ALIGNED_CAST(struct tpacket_auxdata *, CMSG_DATA(cmsg));
+             if (auxdata_has_vlan_tci(aux)) {
+-                struct eth_header *eth;
+-                bool double_tagged;
+-
+-                eth = dp_packet_data(pkt);
+-                double_tagged = eth->eth_type == htons(ETH_TYPE_VLAN_8021Q);
+-
+-                eth_push_vlan(pkt,
+-                              auxdata_to_vlan_tpid(aux, double_tagged),
+-                              htons(aux->tp_vlan_tci));
++                push_vlan_to_dp_packet(aux->tp_status, aux->tp_vlan_tpid,
++                                       aux->tp_vlan_tci, pkt);
+                 break;
+             }
+         }
+@@ -1481,8 +1782,8 @@ netdev_linux_batch_rxq_recv_sock(struct netdev_rxq_linux *rx, int mtu,
+  * packets are added into *batch. The return value is 0 or errno.
+  */
+ static int
+-netdev_linux_batch_rxq_recv_tap(struct netdev_rxq_linux *rx, int mtu,
+-                                struct dp_packet_batch *batch)
++netdev_linux_batch_rxq_recv_tap(struct netdev_rxq_linux *rx, bool tso,
++                                int mtu, struct dp_packet_batch *batch)
+ {
+     int virtio_net_hdr_size;
+     ssize_t retval;
+@@ -1490,7 +1791,7 @@ netdev_linux_batch_rxq_recv_tap(struct netdev_rxq_linux *rx, int mtu,
+     int iovlen;
+     int i;
+ 
+-    if (userspace_tso_enabled()) {
++    if (tso) {
+         /* Use the buffer from the allocated packet below to receive MTU
+          * sized packets and an aux_buf for extra TSO data. */
+         iovlen = IOV_TSO_SIZE;
+@@ -1575,12 +1876,13 @@ netdev_linux_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch,
+     struct netdev *netdev = rx->up.netdev;
+     ssize_t retval;
+     int mtu;
++    bool tso = userspace_tso_enabled();
+ 
+     if (netdev_linux_get_mtu__(netdev_linux_cast(netdev), &mtu)) {
+         mtu = ETH_PAYLOAD_MAX;
+     }
+ 
+-    if (userspace_tso_enabled()) {
++    if (tso) {
+         /* Allocate TSO packets. The packet has enough headroom to store
+          * a full non-TSO packet. When a TSO packet is received, the data
+          * from non-TSO buffer (std_len) is prepended to the TSO packet
+@@ -1599,8 +1901,8 @@ netdev_linux_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet_batch *batch,
+ 
+     dp_packet_batch_init(batch);
+     retval = (rx->is_tap
+-              ? netdev_linux_batch_rxq_recv_tap(rx, mtu, batch)
+-              : netdev_linux_batch_rxq_recv_sock(rx, mtu, batch));
++              ? netdev_linux_batch_rxq_recv_tap(rx, tso, mtu, batch)
++              : netdev_linux_batch_recv(rx, tso, mtu, batch));
+ 
+     if (retval) {
+         if (retval != EAGAIN && retval != EMSGSIZE) {
+@@ -1665,7 +1967,9 @@ netdev_linux_rxq_drain(struct netdev_rxq *rxq_)
+ }
+ 
+ static int
+-netdev_linux_sock_batch_send(int sock, int ifindex, bool tso, int mtu,
++netdev_linux_sock_batch_send(int sock, int ifindex,
++                             struct netdev *netdev_ OVS_UNUSED,
++                             bool tso, int mtu,
+                              struct dp_packet_batch *batch)
+ {
+     const size_t size = dp_packet_batch_size(batch);
+@@ -1875,6 +2179,147 @@ netdev_linux_get_numa_id(const struct netdev *netdev_)
+     return numa_id;
+ }
+ 
++#ifdef HAVE_TPACKET_V3
++static inline int
++tpacket_tx_is_ready_v3(struct tpacket3_hdr *hdr)
++{
++    return !(hdr->tp_status & (TP_STATUS_SEND_REQUEST | TP_STATUS_SENDING));
++}
++
++static inline int
++tpacket_tx_is_ready_v2(struct tpacket2_hdr *hdr)
++{
++    return !(hdr->tp_status & (TP_STATUS_SEND_REQUEST | TP_STATUS_SENDING));
++}
++
++static inline void
++kick_off_tpacket_send(int sockfd, struct netdev_linux *netdev,
++                      struct dp_packet_batch *batch)
++{
++    ssize_t bytes_sent;
++    bytes_sent = sendto(sockfd, NULL, 0, MSG_DONTWAIT, NULL, 0);
++    if (bytes_sent == -1 &&
++        errno != ENOBUFS && errno != EAGAIN) {
++        /*
++         * In case of an ENOBUFS/EAGAIN error all of the enqueued
++         * packets will be considered successful even though only some
++         * are sent.
++         */
++        netdev->tx_dropped += dp_packet_batch_size(batch);
++    }
++}
++
++static int
++netdev_linux_tpacket_batch_send_v3(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
++                                   struct netdev *netdev_, bool tso, int mtu,
++                                   struct dp_packet_batch *batch)
++{
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct dp_packet *packet;
++    int total_pkts = 0;
++    unsigned int tpacket_hdr_len = TPACKET3_HDRLEN;
++    unsigned int frame_nr = netdev->tp_tx_ring->req3.tp_frame_nr;
++    unsigned int frame_num = netdev->tp_tx_ring->frame_num;
++    struct tpacket3_hdr *ppd;
++
++    /* The Linux tap driver returns EIO if the device is not up,
++     * so if the device is not up, don't waste time sending it.
++     * However, if the device is in another network namespace
++     * then OVS can't retrieve the state. In that case, send the
++     * packets anyway. */
++    if (netdev->present && !(netdev->ifi_flags & IFF_UP)) {
++        netdev->tx_dropped += dp_packet_batch_size(batch);
++        return 0;
++    }
++
++    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
++        size_t size;
++
++        if (tso) {
++            netdev_linux_prepend_vnet_hdr(packet, mtu);
++        }
++
++        size = dp_packet_size(packet);
++        ppd = tpacket_get_next_frame_v3(netdev->tp_tx_ring, frame_num);
++
++        if (!tpacket_tx_is_ready_v3(ppd)) {
++            break;
++        }
++        ppd->tp_snaplen = size;
++        ppd->tp_len = size;
++        ppd->tp_next_offset = 0;
++
++        memcpy((uint8_t *)ppd + tpacket_hdr_len - sizeof(struct sockaddr_ll),
++               dp_packet_data(packet),
++               size);
++        ppd->tp_status = TP_STATUS_SEND_REQUEST;
++        frame_num = (frame_num + 1) % frame_nr;
++        total_pkts++;
++    }
++    netdev->tp_tx_ring->frame_num = frame_num;
++
++    /* Kick-off transmits */
++    if (total_pkts != 0) {
++        kick_off_tpacket_send(netdev->tp_tx_ring->sockfd, netdev, batch);
++    }
++    return 0;
++}
++
++static int
++netdev_linux_tpacket_batch_send_v2(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
++                                   struct netdev *netdev_, bool tso, int mtu,
++                                   struct dp_packet_batch *batch)
++{
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct dp_packet *packet;
++    int total_pkts = 0;
++    unsigned int tpacket_hdr_len = TPACKET2_HDRLEN;
++    unsigned int frame_nr = netdev->tp_tx_ring->rd_num;
++    unsigned int frame_num = netdev->tp_tx_ring->frame_num;
++    struct tpacket2_hdr *ppd;
++
++    /* The Linux tap driver returns EIO if the device is not up,
++     * so if the device is not up, don't waste time sending it.
++     * However, if the device is in another network namespace
++     * then OVS can't retrieve the state. In that case, send the
++     * packets anyway. */
++    if (netdev->present && !(netdev->ifi_flags & IFF_UP)) {
++        netdev->tx_dropped += dp_packet_batch_size(batch);
++        return 0;
++    }
++
++    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
++        size_t size;
++
++        if (tso) {
++            netdev_linux_prepend_vnet_hdr(packet, mtu);
++        }
++
++        size = dp_packet_size(packet);
++        ppd = tpacket_get_next_frame_v2(netdev->tp_tx_ring, frame_num);
++        if (!tpacket_tx_is_ready_v2(ppd)) {
++            break;
++        }
++        ppd->tp_snaplen = size;
++        ppd->tp_len = size;
++
++        memcpy((uint8_t *)ppd + tpacket_hdr_len - sizeof(struct sockaddr_ll),
++               dp_packet_data(packet),
++               size);
++        ppd->tp_status = TP_STATUS_SEND_REQUEST;
++        frame_num = (frame_num + 1) % frame_nr;
++        total_pkts++;
++    }
++    netdev->tp_tx_ring->frame_num = frame_num;
++
++    /* Kick-off transmits */
++    if (total_pkts != 0) {
++        kick_off_tpacket_send(netdev->tp_tx_ring->sockfd, netdev, batch);
++    }
++    return 0;
++}
++#endif
++
+ /* Sends 'batch' on 'netdev'.  Returns 0 if successful, otherwise a positive
+  * errno value.  Returns EAGAIN without blocking if the packet cannot be queued
+  * immediately.  Returns EMSGSIZE if a partial packet was transmitted or if
+@@ -1914,7 +2359,8 @@ netdev_linux_send(struct netdev *netdev_, int qid OVS_UNUSED,
+             goto free_batch;
+         }
+ 
+-        error = netdev_linux_sock_batch_send(sock, ifindex, tso, mtu, batch);
++        error = netdev_linux_batch_send(sock, ifindex, netdev_, tso,
++                                        mtu, batch);
+     } else {
+         error = netdev_linux_tap_batch_send(netdev_, tso, mtu, batch);
+     }
+@@ -4090,6 +4536,184 @@ codel_install__(struct netdev *netdev_, uint32_t target, uint32_t limit,
+     netdev->tc = &codel->tc;
+ }
+ 
++#ifdef HAVE_TPACKET_V3
++static int
++netdev_linux_batch_recv_tpacket_v3(struct netdev_rxq_linux *rx, bool tso,
++                                int mtu OVS_UNUSED,
++                                struct dp_packet_batch *batch)
++{
++    struct netdev *netdev_ = netdev_rxq_get_netdev(&rx->up);
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct dp_packet *buffer;
++    int i = 0;
++    unsigned int block_num;
++    unsigned int fn_in_block;
++    struct tpacket_block_desc *pbd;
++    struct tpacket3_hdr *ppd;
++    int virtio_net_hdr_size;
++
++#ifdef DPDK_NETDEV
++    if (rx->dpdk_mp == NULL) {
++        dpdk_mp_create_for_nondpdk_ports(&rx->dpdk_mp,
++                                         netdev_get_name(rx->up.netdev),
++                                         mtu);
++    }
++#endif
++
++    if (tso) {
++        virtio_net_hdr_size = sizeof(struct virtio_net_hdr);
++    } else {
++        virtio_net_hdr_size = 0;
++    }
++
++    ppd = ALIGNED_CAST(struct tpacket3_hdr *, netdev->tp_rx_ring->ppd);
++    block_num = netdev->tp_rx_ring->block_num;
++    fn_in_block = netdev->tp_rx_ring->frame_num_in_block;
++    pbd = ALIGNED_CAST(struct tpacket_block_desc *,
++              netdev->tp_rx_ring->rd[block_num].iov_base);
++
++    while (i < NETDEV_MAX_BURST) {
++        if ((pbd->hdr.bh1.block_status & TP_STATUS_USER) == 0) {
++            break;
++        }
++        if (fn_in_block == 0) {
++            ppd = ALIGNED_CAST(struct tpacket3_hdr *, (uint8_t *) pbd +
++                                   pbd->hdr.bh1.offset_to_first_pkt);
++        }
++
++#ifdef DPDK_NETDEV
++        dpdk_dp_packet_new_with_headroom(
++            rx->dpdk_mp,
++            ppd->tp_snaplen + virtio_net_hdr_size + VLAN_ETH_HEADER_LEN,
++            &buffer);
++#else
++        buffer = dp_packet_new_with_headroom(
++                     ppd->tp_snaplen + virtio_net_hdr_size
++                         + VLAN_ETH_HEADER_LEN, DP_NETDEV_HEADROOM);
++#endif
++        memcpy(dp_packet_data(buffer), (uint8_t *)ppd + ppd->tp_mac
++                                           - virtio_net_hdr_size,
++               ppd->tp_snaplen + virtio_net_hdr_size);
++        dp_packet_set_size(buffer, ppd->tp_snaplen + virtio_net_hdr_size);
++
++        if (virtio_net_hdr_size && netdev_linux_parse_vnet_hdr(buffer)) {
++            /* Unexpected error situation: the virtio header is not present
++             * or corrupted. Drop the packet but continue in case next ones
++             * are correct. */
++            dp_packet_delete(buffer);
++            netdev->rx_dropped += 1;
++            VLOG_WARN_RL(&rl, "%s: Dropped packet: Invalid virtio net header",
++                         netdev_get_name(netdev_));
++        } else {
++            if (ppd->tp_status & TP_STATUS_VLAN_VALID) {
++                push_vlan_to_dp_packet(ppd->tp_status, ppd->hv1.tp_vlan_tpid,
++                                       ppd->hv1.tp_vlan_tci, buffer);
++            }
++            dp_packet_batch_add(batch, buffer);
++        }
++
++        fn_in_block++;
++        if (fn_in_block >= pbd->hdr.bh1.num_pkts) {
++            pbd->hdr.bh1.block_status = TP_STATUS_KERNEL;
++            block_num = (block_num + 1) %
++                            netdev->tp_rx_ring->req3.tp_block_nr;
++            pbd = (struct tpacket_block_desc *)
++                     netdev->tp_rx_ring->rd[block_num].iov_base;
++            fn_in_block = 0;
++            ppd = NULL;
++        } else {
++            ppd = ALIGNED_CAST(struct tpacket3_hdr *,
++                   (uint8_t *) ppd + ppd->tp_next_offset);
++        }
++        i++;
++    }
++
++    netdev->tp_rx_ring->block_num = block_num;
++    netdev->tp_rx_ring->frame_num_in_block = fn_in_block;
++    netdev->tp_rx_ring->ppd = ppd;
++
++    return 0;
++}
++
++static int
++netdev_linux_batch_recv_tpacket_v2(struct netdev_rxq_linux *rx, bool tso,
++                                int mtu OVS_UNUSED,
++                                struct dp_packet_batch *batch)
++{
++    struct netdev *netdev_ = netdev_rxq_get_netdev(&rx->up);
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct dp_packet *buffer;
++    int i = 0;
++    struct tpacket2_hdr *ppd;
++    unsigned int frame_num;
++    unsigned int frame_nr = netdev->tp_rx_ring->rd_num;
++    int virtio_net_hdr_size;
++
++#ifdef DPDK_NETDEV
++    if (rx->dpdk_mp == NULL) {
++        dpdk_mp_create_for_nondpdk_ports(&rx->dpdk_mp,
++                                         netdev_get_name(rx->up.netdev),
++                                         mtu);
++    }
++#endif
++
++    if (tso) {
++        virtio_net_hdr_size = sizeof(struct virtio_net_hdr);
++    } else {
++        virtio_net_hdr_size = 0;
++    }
++
++    frame_num = netdev->tp_rx_ring->frame_num;
++
++    while (i < NETDEV_MAX_BURST) {
++        ppd = (struct tpacket2_hdr *)
++                  netdev->tp_rx_ring->rd[frame_num].iov_base;
++        if ((ppd->tp_status & TP_STATUS_USER) == 0) {
++            break;
++        }
++
++#ifdef DPDK_NETDEV
++        dpdk_dp_packet_new_with_headroom(
++            rx->dpdk_mp,
++            ppd->tp_snaplen + virtio_net_hdr_size + VLAN_ETH_HEADER_LEN,
++            &buffer);
++#else
++        buffer = dp_packet_new_with_headroom(
++                     ppd->tp_snaplen + virtio_net_hdr_size
++                         + VLAN_ETH_HEADER_LEN, DP_NETDEV_HEADROOM);
++#endif
++        memcpy(dp_packet_data(buffer), (uint8_t *)ppd + ppd->tp_mac
++                                           - virtio_net_hdr_size,
++               ppd->tp_snaplen + virtio_net_hdr_size);
++        dp_packet_set_size(buffer, ppd->tp_snaplen + virtio_net_hdr_size);
++
++        if (virtio_net_hdr_size && netdev_linux_parse_vnet_hdr(buffer)) {
++            /* Unexpected error situation: the virtio header is not present
++             * or corrupted. Drop the packet but continue in case next ones
++             * are correct. */
++            dp_packet_delete(buffer);
++            netdev->rx_dropped += 1;
++            VLOG_WARN_RL(&rl, "%s: Dropped packet: Invalid virtio net header",
++                         netdev_get_name(netdev_));
++        } else {
++            if (ppd->tp_status & TP_STATUS_VLAN_VALID) {
++                push_vlan_to_dp_packet(ppd->tp_status, ppd->tp_vlan_tpid,
++                                       ppd->tp_vlan_tci, buffer);
++            }
++            dp_packet_batch_add(batch, buffer);
++            frame_num = (frame_num + 1) % frame_nr;
++        }
++
++        ppd->tp_status = TP_STATUS_KERNEL;
++        i++;
++    }
++
++    netdev->tp_rx_ring->frame_num = frame_num;
++
++    return 0;
++}
++#endif /* HAVE_TPACKET_V3 */
++
+ static int
+ codel_setup_qdisc__(struct netdev *netdev, uint32_t target, uint32_t limit,
+                     uint32_t interval)
+diff --git a/lib/userspace-use-tpacket.c b/lib/userspace-use-tpacket.c
+new file mode 100644
+index 000000000..cde998186
+--- /dev/null
++++ b/lib/userspace-use-tpacket.c
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2020 Inspur, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include "smap.h"
++#include "ovs-thread.h"
++#include "openvswitch/vlog.h"
++#include "dpdk.h"
++#include "userspace-tso.h"
++#include "userspace-use-tpacket.h"
++#include "vswitch-idl.h"
++
++VLOG_DEFINE_THIS_MODULE(userspace_use_tpacket);
++
++static bool use_tpacket = true;
++
++void
++userspace_use_tpacket_init(const struct smap *ovs_other_config)
++{
++    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
++
++    if (ovsthread_once_start(&once)) {
++#ifdef HAVE_TPACKET_V3
++        int tpacket_ver = 3;
++
++        if (userspace_tso_enabled()) {
++            tpacket_ver = 2;
++        }
++        if (smap_get_bool(ovs_other_config, "userspace-use-tpacket", true)) {
++#ifdef DPDK_NETDEV
++            VLOG_INFO("Userspace is using tpacket v%d", tpacket_ver);
++#else
++            use_tpacket = false;
++            VLOG_INFO("Userspace doesn't use tpacket");
++#endif
++        } else {
++            use_tpacket = false;
++            VLOG_INFO("Userspace doesn't use tpacket");
++        }
++#else
++        use_tpacket = false;
++#endif
++        ovsthread_once_done(&once);
++    }
++}
++
++bool
++userspace_use_tpacket(void)
++{
++    return use_tpacket;
++}
+diff --git a/lib/userspace-use-tpacket.h b/lib/userspace-use-tpacket.h
+new file mode 100644
+index 000000000..3c2cb6a92
+--- /dev/null
++++ b/lib/userspace-use-tpacket.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2020 Inspur, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef USERSPACE_USE_TPACKET_H
++#define USERSPACE_USE_TPACKET_H 1
++
++void userspace_use_tpacket_init(const struct smap *ovs_other_config);
++bool userspace_use_tpacket(void);
++
++#endif /* userspace-use-tpacket.h */
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index 6d0ac2ae9..a865ecdf5 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -68,6 +68,7 @@
+ #include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
+ #include "userspace-tso-segsz.h"
++#include "userspace-use-tpacket.h"
+ #include "userspace-vxlan-port.h"
+ #include "util.h"
+ #include "unixctl.h"
+@@ -3304,6 +3305,7 @@ bridge_run(void)
+         userspace_sock_buf_size_init(&cfg->other_config);
+         userspace_tso_segsz_init(&cfg->other_config);
+         userspace_vxlan_port_init(&cfg->other_config);
++        userspace_use_tpacket_init(&cfg->other_config);
+     }
+ 
+     /* Initialize the ofproto library.  This only needs to run once, but
+-- 
+2.17.1
+

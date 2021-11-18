@@ -1,0 +1,378 @@
+From d2a4823a1d6f0cfb5cddd582dac044486280009b Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 6 Jan 2021 02:10:21 -0500
+Subject: [PATCH 37/47] Fix ovs restart issue in case of DPDK
+
+Once a tap interface is moved to network namespace, ovs can't
+open it when it is restarted, instead, it will create a new one
+, so this tap interface won't work.
+
+This commit fixed it, it used netns option for interface, which
+saved network namespace of this interface, ovs will enter this
+netns when it opens this interface, so it can get file handle
+correctly and make sure rx and tx function can work as before.
+
+FYI: example netns config for reference
+
+ Port "qr-a14cf280-7e"
+     tag: 2
+     Interface "qr-a14cf280-7e"
+         type: internal
+         options: {netns="qrouter-aedf13ec-05cc-4650-9b42-3ff3210be159"}
+ Port "fg-e7efd34d-3d"
+     tag: 1
+     Interface "fg-e7efd34d-3d"
+         type: internal
+         options: {netns="fip-2aaca0ad-df37-4f41-984d-70d45f3ce1eb"}
+ Port "qr-f8b676bf-b3"
+     tag: 2
+     Interface "qr-f8b676bf-b3"
+         type: internal
+         options: {netns="qrouter-aedf13ec-05cc-4650-9b42-3ff3210be159"}
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dpctl.c                  |  8 ++++----
+ lib/dpif-netdev.c            |  2 +-
+ lib/dpif-netlink-rtnl.c      |  2 +-
+ lib/dpif.c                   |  2 +-
+ lib/netdev-linux.c           | 27 ++++++++++++++++++++++++++-
+ lib/netdev-provider.h        |  1 +
+ lib/netdev-vport.c           |  2 +-
+ lib/netdev.c                 |  9 +++++++--
+ lib/netdev.h                 |  3 ++-
+ lib/ovs-router.c             |  2 +-
+ lib/tnl-ports.c              |  3 ++-
+ ofproto/in-band.c            |  4 ++--
+ ofproto/ofproto-dpif-xlate.c |  2 +-
+ ofproto/ofproto.c            |  2 +-
+ vswitchd/bridge.c            |  6 ++++--
+ 15 files changed, 55 insertions(+), 20 deletions(-)
+
+diff --git a/lib/dpctl.c b/lib/dpctl.c
+index 2f859a753..7eef53945 100644
+--- a/lib/dpctl.c
++++ b/lib/dpctl.c
+@@ -338,7 +338,7 @@ dpctl_add_if(int argc OVS_UNUSED, const char *argv[],
+             }
+         }
+ 
+-        error = netdev_open(name, type, &netdev);
++        error = netdev_open(name, type, &netdev, NULL);
+         if (error) {
+             dpctl_error(dpctl_p, error, "%s: failed to open network device",
+                         name);
+@@ -421,7 +421,7 @@ dpctl_set_if(int argc, const char *argv[], struct dpctl_params *dpctl_p)
+         dpif_port_destroy(&dpif_port);
+ 
+         /* Retrieve its existing configuration. */
+-        error = netdev_open(name, type, &netdev);
++        error = netdev_open(name, type, &netdev, NULL);
+         if (error) {
+             dpctl_error(dpctl_p, error, "%s: failed to open network device",
+                         name);
+@@ -637,7 +637,7 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
+ 
+             dpctl_print(dpctl_p, " (%s", dpif_port.type);
+ 
+-            error = netdev_open(dpif_port.name, dpif_port.type, &netdev);
++            error = netdev_open(dpif_port.name, dpif_port.type, &netdev, NULL);
+             if (!error) {
+                 struct smap config;
+ 
+@@ -670,7 +670,7 @@ show_dpif(struct dpif *dpif, struct dpctl_params *dpctl_p)
+             struct netdev_stats s;
+             int error;
+ 
+-            error = netdev_open(dpif_port.name, dpif_port.type, &netdev);
++            error = netdev_open(dpif_port.name, dpif_port.type, &netdev, NULL);
+             if (error) {
+                 dpctl_print(dpctl_p, ", open failed (%s)",
+                             ovs_strerror(error));
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 493cc1d0a..edc85e978 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -2061,7 +2061,7 @@ port_create(const char *devname, const char *type,
+     *portp = NULL;
+ 
+     /* Open and validate network device. */
+-    error = netdev_open(devname, type, &netdev);
++    error = netdev_open(devname, type, &netdev, NULL);
+     if (error) {
+         return error;
+     }
+diff --git a/lib/dpif-netlink-rtnl.c b/lib/dpif-netlink-rtnl.c
+index fd157ce2d..ae3613ea7 100644
+--- a/lib/dpif-netlink-rtnl.c
++++ b/lib/dpif-netlink-rtnl.c
+@@ -504,7 +504,7 @@ dpif_netlink_rtnl_probe_oot_tunnels(void)
+     const char *name;
+     int error;
+ 
+-    error = netdev_open("ovs-system-probe", "geneve", &netdev);
++    error = netdev_open("ovs-system-probe", "geneve", &netdev, NULL);
+     if (!error) {
+         struct ofpbuf *reply;
+         const struct netdev_tunnel_config *tnl_cfg;
+diff --git a/lib/dpif.c b/lib/dpif.c
+index 7cac3a629..b06b83274 100644
+--- a/lib/dpif.c
++++ b/lib/dpif.c
+@@ -361,7 +361,7 @@ do_open(const char *name, const char *type, bool create, struct dpif **dpifp)
+                 continue;
+             }
+ 
+-            err = netdev_open(dpif_port.name, dpif_port.type, &netdev);
++            err = netdev_open(dpif_port.name, dpif_port.type, &netdev, NULL);
+ 
+             if (!err) {
+                 netdev_ports_insert(netdev, dpif_type_str, &dpif_port);
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 7ecdd379a..04c9b75b4 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1001,9 +1001,24 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+     static const char tap_dev[] = "/dev/net/tun";
+     const char *name = netdev_->name;
+     struct ifreq ifr;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++    int error;
+ 
+-    int error = netdev_linux_common_construct(netdev_);
++    if (is_tap_netdev(netdev_) && (netdev_->netns != NULL)) {
++        netdev->netns = xstrdup(netdev_->netns);
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
++
++    error = netdev_linux_common_construct(netdev_);
+     if (error) {
++        if (is_tap_in_netns) {
++            exit_netns(&netns_knob);
++        }
+         return error;
+     }
+ 
+@@ -1012,6 +1027,9 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+     if (netdev->tap_fd < 0) {
+         error = errno;
+         VLOG_WARN("opening \"%s\" failed: %s", tap_dev, ovs_strerror(error));
++        if (is_tap_in_netns) {
++            exit_netns(&netns_knob);
++        }
+         return error;
+     }
+ 
+@@ -1060,11 +1078,18 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+         }
+     }
+ 
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     netdev->present = true;
+     return 0;
+ 
+ error_close:
+     close(netdev->tap_fd);
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
+     return error;
+ }
+ 
+diff --git a/lib/netdev-provider.h b/lib/netdev-provider.h
+index 6660e5b5a..0f6ee4f38 100644
+--- a/lib/netdev-provider.h
++++ b/lib/netdev-provider.h
+@@ -100,6 +100,7 @@ struct netdev {
+     OVSRCU_TYPE(const struct netdev_flow_api *) flow_api;
+     const char *dpif_type;          /* Type of dpif this netdev belongs to. */
+     struct netdev_hw_info hw_info;  /* Offload-capable netdev info. */
++    char *netns;
+ };
+ 
+ static inline void
+diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
+index 7c99f790d..f113bc541 100644
+--- a/lib/netdev-vport.c
++++ b/lib/netdev-vport.c
+@@ -290,7 +290,7 @@ tunnel_check_status_change__(struct netdev_vport *netdev)
+     if (ovs_router_lookup(mark, route, iface, NULL, &gw)) {
+         struct netdev *egress_netdev;
+ 
+-        if (!netdev_open(iface, NULL, &egress_netdev)) {
++        if (!netdev_open(iface, NULL, &egress_netdev, NULL)) {
+             status = netdev_get_carrier(egress_netdev);
+             netdev_close(egress_netdev);
+         }
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 8c5ba5e5c..9cd3835d5 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -376,7 +376,8 @@ netdev_is_reserved_name(const char *name)
+  * reconfigured (with netdev_is_reconf_required() and netdev_reconfigure()).
+  * */
+ int
+-netdev_open(const char *name, const char *type, struct netdev **netdevp)
++netdev_open(const char *name, const char *type, struct netdev **netdevp,
++            const char *netns)
+     OVS_EXCLUDED(netdev_mutex)
+ {
+     struct netdev *netdev;
+@@ -442,6 +443,9 @@ netdev_open(const char *name, const char *type, struct netdev **netdevp)
+ 
+                 ovs_list_init(&netdev->saved_flags_list);
+ 
++                if (netns) {
++                    netdev->netns = xstrdup(netns);
++                }
+                 error = rc->class->construct(netdev);
+                 if (!error) {
+                     netdev_change_seq_changed(netdev);
+@@ -591,6 +595,7 @@ netdev_unref(struct netdev *dev)
+             shash_delete(&netdev_shash, dev->node);
+         }
+         free(dev->name);
++        free(dev->netns);
+         seq_destroy(dev->reconfigure_seq);
+         dev->netdev_class->dealloc(dev);
+         ovs_mutex_unlock(&netdev_mutex);
+@@ -1402,7 +1407,7 @@ netdev_get_addresses_by_name(const char *device_name,
+                              struct in6_addr **addrsp, int *n_addrsp)
+ {
+     struct netdev *netdev;
+-    int error = netdev_open(device_name, NULL, &netdev);
++    int error = netdev_open(device_name, NULL, &netdev, NULL);
+     if (error) {
+         *addrsp = NULL;
+         *n_addrsp = 0;
+diff --git a/lib/netdev.h b/lib/netdev.h
+index f7cdfdab7..cd0014027 100644
+--- a/lib/netdev.h
++++ b/lib/netdev.h
+@@ -154,7 +154,8 @@ void netdev_set_internal(struct netdev *netdev);
+ bool netdev_has_tunnel_push_pop(const struct netdev *netdev);
+ 
+ /* Open and close. */
+-int netdev_open(const char *name, const char *type, struct netdev **netdevp);
++int netdev_open(const char *name, const char *type, struct netdev **netdevp,
++                const char *netns);
+ 
+ struct netdev *netdev_ref(const struct netdev *);
+ void netdev_remove(struct netdev *);
+diff --git a/lib/ovs-router.c b/lib/ovs-router.c
+index 09b81c6e5..887f867b9 100644
+--- a/lib/ovs-router.c
++++ b/lib/ovs-router.c
+@@ -173,7 +173,7 @@ get_src_addr(const struct in6_addr *ip6_dst,
+     struct netdev *dev;
+     bool is_ipv4;
+ 
+-    err = netdev_open(output_bridge, NULL, &dev);
++    err = netdev_open(output_bridge, NULL, &dev, NULL);
+     if (err) {
+         return err;
+     }
+diff --git a/lib/tnl-ports.c b/lib/tnl-ports.c
+index 58269d3b1..55fac2da5 100644
+--- a/lib/tnl-ports.c
++++ b/lib/tnl-ports.c
+@@ -411,7 +411,8 @@ insert_ipdev(const char dev_name[])
+     struct netdev *dev;
+     int error, n_in6;
+ 
+-    error = netdev_open(dev_name, netdev_get_type_from_name(dev_name), &dev);
++    error = netdev_open(dev_name, netdev_get_type_from_name(dev_name), &dev,
++                            NULL);
+     if (error) {
+         return;
+     }
+diff --git a/ofproto/in-band.c b/ofproto/in-band.c
+index 82d8dfa14..b872af15c 100644
+--- a/ofproto/in-band.c
++++ b/ofproto/in-band.c
+@@ -138,7 +138,7 @@ refresh_remote(struct in_band *ib, struct in_band_remote *r)
+     {
+         netdev_close(r->remote_netdev);
+ 
+-        retval = netdev_open(next_hop_dev, NULL, &r->remote_netdev);
++        retval = netdev_open(next_hop_dev, NULL, &r->remote_netdev, NULL);
+         if (retval) {
+             VLOG_WARN_RL(&rl, "%s: cannot open netdev %s (next hop "
+                          "to controller "IP_FMT"): %s",
+@@ -431,7 +431,7 @@ in_band_create(struct ofproto *ofproto, const char *local_name,
+     const char *type = ofproto_port_open_type(ofproto, "internal");
+ 
+     *in_bandp = NULL;
+-    error = netdev_open(local_name, type, &local_netdev);
++    error = netdev_open(local_name, type, &local_netdev, NULL);
+     if (error) {
+         VLOG_ERR("%s: failed to initialize in-band control: cannot open "
+                  "datapath local port %s (%s)", ofproto->name,
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index 1f78da105..b25d4ee0d 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -897,7 +897,7 @@ xbridge_addr_create(struct xbridge *xbridge)
+     struct netdev *dev;
+     int err, n_addr = 0;
+ 
+-    err = netdev_open(xbridge->name, NULL, &dev);
++    err = netdev_open(xbridge->name, NULL, &dev, NULL);
+     if (!err) {
+         err = netdev_get_addr_list(dev, &addr, &mask, &n_addr);
+         if (!err) {
+diff --git a/ofproto/ofproto.c b/ofproto/ofproto.c
+index 59f06aa94..961c67078 100644
+--- a/ofproto/ofproto.c
++++ b/ofproto/ofproto.c
+@@ -2401,7 +2401,7 @@ ofport_open(struct ofproto *ofproto,
+     int error;
+ 
+     *p_netdev = NULL;
+-    error = netdev_open(ofproto_port->name, ofproto_port->type, &netdev);
++    error = netdev_open(ofproto_port->name, ofproto_port->type, &netdev, NULL);
+     if (error) {
+         VLOG_WARN_RL(&rl, "%s: ignoring port %s (%"PRIu32") because netdev %s "
+                      "cannot be opened (%s)",
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index 40578f1ec..04bef2aae 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -2037,6 +2037,7 @@ iface_do_create(const struct bridge *br,
+     int error;
+     const char *type;
+     const char *iface_type;
++    const char *netns = NULL;
+ 
+     if (netdev_is_reserved_name(iface_cfg->name)) {
+         VLOG_WARN("could not create interface %s, name is reserved",
+@@ -2047,7 +2048,8 @@ iface_do_create(const struct bridge *br,
+ 
+     iface_type = iface_get_type(iface_cfg, br->cfg);
+     type = ofproto_port_open_type(br->ofproto, iface_type);
+-    error = netdev_open(iface_cfg->name, type, &netdev);
++    netns = smap_get(&iface_cfg->options, "netns");
++    error = netdev_open(iface_cfg->name, type, &netdev, netns);
+     if (error) {
+         VLOG_WARN_BUF(errp, "could not open network device %s (%s)",
+                       iface_cfg->name, ovs_strerror(error));
+@@ -2145,7 +2147,7 @@ iface_create(struct bridge *br, const struct ovsrec_interface *iface_cfg,
+ 
+         if (ofproto_port_query_by_name(br->ofproto, port->name,
+                                        &ofproto_port)) {
+-            error = netdev_open(port->name, "internal", &netdev);
++            error = netdev_open(port->name, "internal", &netdev, NULL);
+             if (!error) {
+                 ofp_port_t fake_ofp_port = OFPP_NONE;
+                 netdev_set_internal(netdev);
+-- 
+2.17.1
+

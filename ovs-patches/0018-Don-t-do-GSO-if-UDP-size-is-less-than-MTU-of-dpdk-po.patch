@@ -1,0 +1,43 @@
+From a01ec27f6e95bf04fd88b511d014048939c10548 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Fri, 25 Sep 2020 04:04:16 -0400
+Subject: [PATCH 18/47] Don't do GSO if UDP size is less than MTU of dpdk port
+
+Note: this leverages UFO feature of vhostuserclient and
+doubles UDP performance.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 0da1e51b1..5104b45a6 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2415,6 +2415,22 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ 
+     /* UDP GSO if necessary */
+     if (l4_proto == IPPROTO_UDP) {
++        /* in case of UFO and pkt_len < dev->mtu, GSO is unnecessary */
++        if (mbuf->pkt_len < dev->mtu + ETH_HEADER_LEN) {
++            mbuf->ol_flags &= ~PKT_TX_UDP_SEG;
++            if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
++                /* Pretend it as a normal UDP and stop inner cksum offload */
++                mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
++                mbuf->ol_flags &= ~PKT_TX_OUTER_IP_CKSUM;
++                mbuf->ol_flags &= ~PKT_TX_OUTER_IPV4;
++                mbuf->l2_len = mbuf->outer_l2_len;
++                mbuf->l3_len = mbuf->outer_l3_len;
++                mbuf->outer_l2_len = 0;
++                mbuf->outer_l3_len = 0;
++            }
++            return true;
++        }
++
+         /* VXLAN GSO can be done here */
+         if ((mbuf->ol_flags & PKT_TX_UDP_SEG) ||
+             (mbuf->pkt_len > (tso_segsz + mbuf->outer_l2_len
+-- 
+2.17.1
+

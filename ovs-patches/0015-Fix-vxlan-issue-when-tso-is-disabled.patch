@@ -1,0 +1,40 @@
+From 063ce10f55e431e758baaf45c8a715de038d924d Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 27 Aug 2020 02:50:06 -0400
+Subject: [PATCH 15/47] Fix vxlan issue when tso is disabled
+
+When tso is disabled, in vxlan case, ping, tcp
+and udp can't work normally, the issue lies in
+vxlan tso offload flag, it shouldn't be set when
+tso is disabled.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 22593c679..568f443c1 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -56,6 +56,7 @@
+ #include "svec.h"
+ #include "openvswitch/vlog.h"
+ #include "flow.h"
++#include "userspace-tso.h"
+ #include "util.h"
+ #ifdef __linux__
+ #include "tc.h"
+@@ -1060,7 +1061,8 @@ netdev_push_header(const struct netdev *netdev,
+                 }
+             }
+             netdev->netdev_class->push_header(netdev, packet, data);
+-            if (data->tnl_type == OVS_VPORT_TYPE_VXLAN) {
++            if (userspace_tso_enabled()
++                && (data->tnl_type == OVS_VPORT_TYPE_VXLAN)) {
+                 /* Just identify it as a vxlan packet, here netdev is
+                  * vxlan_sys_*, netdev->ol_flags can't indicate if final
+                  * physical output port can support VXLAN TSO, in
+-- 
+2.17.1
+

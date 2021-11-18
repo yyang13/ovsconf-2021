@@ -1,0 +1,266 @@
+From bee725c3748114072400814b394d79037edde664 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 24 Aug 2020 02:24:44 -0400
+Subject: [PATCH 11/47] Allow to set tso_segsz
+
+In some environments, VM MTU can be 8950, maybe it
+is 1450 in others, so we allow users to set it per
+their own environment.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/automake.mk           |  2 ++
+ lib/netdev-dpdk.c         | 32 ++++++++++++-----------
+ lib/userspace-tso-segsz.c | 55 +++++++++++++++++++++++++++++++++++++++
+ lib/userspace-tso-segsz.h | 23 ++++++++++++++++
+ vswitchd/bridge.c         |  2 ++
+ 5 files changed, 99 insertions(+), 15 deletions(-)
+ create mode 100644 lib/userspace-tso-segsz.c
+ create mode 100644 lib/userspace-tso-segsz.h
+
+diff --git a/lib/automake.mk b/lib/automake.mk
+index ffbc3e312..af85ccafb 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -347,6 +347,8 @@ lib_libopenvswitch_la_SOURCES = \
+         lib/userspace-sock-buf-size.h \
+ 	lib/userspace-tso.c \
+ 	lib/userspace-tso.h \
++	lib/userspace-tso-segsz.c \
++	lib/userspace-tso-segsz.h \
+ 	lib/util.c \
+ 	lib/util.h \
+ 	lib/uuid.c \
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index dff71c0fb..12e656631 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -77,6 +77,7 @@
+ #include "unaligned.h"
+ #include "unixctl.h"
+ #include "userspace-tso.h"
++#include "userspace-tso-segsz.h"
+ #include "util.h"
+ #include "uuid.h"
+ 
+@@ -2207,13 +2208,14 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+     struct rte_ipv4_hdr *ip_hdr;
+     struct rte_ipv6_hdr *ip6_hdr;
++    const uint16_t tso_segsz = get_userspace_tso_segsz();
+ 
+     /* Return directly if source and destitation of mbuf are local ports
+      * because mbuf has already set ol_flags and l*_len correctly.
+      */
+     if (is_local_to_local(mbuf->port, dev)) {
+         if (mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)) {
+-            mbuf->tso_segsz = 1450 - mbuf->l3_len - mbuf->l4_len;
++            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
+         }
+         return true;
+     }
+@@ -2224,7 +2226,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      */
+     if (((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
+         (mbuf->l2_len == UDP_VXLAN_ETH_HDR_SIZE) &&
+-        (mbuf->pkt_len > 1464)) {
++        (mbuf->pkt_len > (tso_segsz + ETH_HEADER_LEN))) {
+         mbuf->ol_flags = 0;
+         mbuf->l2_len -= sizeof(struct udp_header)
+                         + sizeof(struct vxlanhdr);
+@@ -2246,7 +2248,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             mbuf->ol_flags |= PKT_TX_UDP_SEG;
+             mbuf->ol_flags |= PKT_TX_UDP_CKSUM;
+         }
+-        mbuf->tso_segsz = 1450;
++        mbuf->tso_segsz = tso_segsz;
+         if (mbuf->tso_segsz > dev->mtu) {
+             mbuf->tso_segsz = dev->mtu;
+         }
+@@ -2264,8 +2266,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+          * outer_l2_len and outer_l3_len must be zeroed.
+          */
+         if (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG))
+-            && (mbuf->pkt_len <= 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
+-                + mbuf->l2_len))  {
++            && (mbuf->pkt_len <= tso_segsz + mbuf->outer_l2_len
++                                     + mbuf->outer_l3_len + mbuf->l2_len))  {
+             mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+             mbuf->l2_len -= sizeof(struct udp_header)
+                         + sizeof(struct vxlanhdr);
+@@ -2309,11 +2311,11 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+ 
+-        /* In case of MTU > 1450, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't
++        /* In case of MTU > tso_segsz, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't
+          * set by client/server, here is a place we can mark it.
+          */
+-        if ((mbuf->pkt_len > 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
+-                + mbuf->l2_len)
++        if ((mbuf->pkt_len > tso_segsz + mbuf->outer_l2_len
++                                 + mbuf->outer_l3_len + mbuf->l2_len)
+             && (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)))) {
+             if (l4_proto == IPPROTO_UDP) {
+                 mbuf->ol_flags |= PKT_TX_UDP_SEG;
+@@ -2349,7 +2351,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         /* In case of GRO, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't set by GRO
+          * APIs, here is a place we can mark it.
+          */
+-        if ((mbuf->pkt_len > 1464)
++        if ((mbuf->pkt_len > (tso_segsz + ETH_HEADER_LEN))
+             && (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)))) {
+             if (l4_proto == IPPROTO_UDP) {
+                 mbuf->ol_flags |= PKT_TX_UDP_SEG;
+@@ -2387,14 +2389,14 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             return false;
+         }
+ 
+-        if (mbuf->pkt_len > 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
++        if (mbuf->pkt_len > tso_segsz + mbuf->outer_l2_len + mbuf->outer_l3_len
+             + mbuf->l2_len) {
+             dp_packet_hwol_set_tcp_seg(pkt);
+         }
+ 
+         mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
+         if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
+-            mbuf->tso_segsz = 1450 - mbuf->l3_len - mbuf->l4_len;
++            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
+         } else {
+             mbuf->tso_segsz = 0;
+         }
+@@ -2412,8 +2414,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+     if (l4_proto == IPPROTO_UDP) {
+         /* VXLAN GSO can be done here */
+         if ((mbuf->ol_flags & PKT_TX_UDP_SEG) ||
+-            (mbuf->pkt_len > (1450 + mbuf->outer_l2_len + mbuf->outer_l3_len +
+-                             mbuf->l2_len))) {
++            (mbuf->pkt_len > (tso_segsz + mbuf->outer_l2_len
++                                  + mbuf->outer_l3_len + mbuf->l2_len))) {
+             dp_packet_hwol_set_udp_seg(pkt);
+ 
+             /* For UDP GSO, udp checksum must be calculated by software */
+@@ -2450,8 +2452,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             }
+ 
+             /* FOR GSO, gso_size includes l2_len + l3_len */
+-            mbuf->tso_segsz = 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len +
+-                              mbuf->l2_len;
++            mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
++                                  + mbuf->outer_l3_len + mbuf->l2_len;
+             if (mbuf->tso_segsz > dev->mtu) {
+                 mbuf->tso_segsz = dev->mtu;
+             }
+diff --git a/lib/userspace-tso-segsz.c b/lib/userspace-tso-segsz.c
+new file mode 100644
+index 000000000..f5856a715
+--- /dev/null
++++ b/lib/userspace-tso-segsz.c
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (c) 2020 Inspur, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include "smap.h"
++#include "ovs-thread.h"
++#include "openvswitch/vlog.h"
++#include "dpdk.h"
++#include "userspace-tso-segsz.h"
++#include "vswitch-idl.h"
++
++VLOG_DEFINE_THIS_MODULE(userspace_tso_segsz);
++
++#define DEFAULT_TSO_SEGSZ 1450
++#define MAX_TSO_SEGSZ 9000
++static uint16_t userspace_tso_segsz = DEFAULT_TSO_SEGSZ;
++
++void
++userspace_tso_segsz_init(const struct smap *ovs_other_config)
++{
++    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
++
++    if (ovsthread_once_start(&once)) {
++        int tso_segsz;
++
++        tso_segsz = smap_get_int(ovs_other_config, "userspace-tso-segsz",
++                       DEFAULT_TSO_SEGSZ);
++        if ((tso_segsz < 0) || (tso_segsz > MAX_TSO_SEGSZ)) {
++            tso_segsz = DEFAULT_TSO_SEGSZ;
++        }
++        userspace_tso_segsz = tso_segsz;
++        VLOG_INFO("Userspace TSO segsz set to %u", userspace_tso_segsz);
++        ovsthread_once_done(&once);
++    }
++}
++
++uint16_t
++get_userspace_tso_segsz(void)
++{
++    return userspace_tso_segsz;
++}
+diff --git a/lib/userspace-tso-segsz.h b/lib/userspace-tso-segsz.h
+new file mode 100644
+index 000000000..c4e9e4649
+--- /dev/null
++++ b/lib/userspace-tso-segsz.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2020 Inspur, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef USERSPACE_TSO_SEGSZ_H
++#define USERSPACE_TSO_SEGSZ_H 1
++
++void userspace_tso_segsz_init(const struct smap *ovs_other_config);
++uint16_t get_userspace_tso_segsz(void);
++
++#endif /* userspace-tso-segsz.h */
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index 0a764cd4a..40578f1ec 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -67,6 +67,7 @@
+ #include "tnl-ports.h"
+ #include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
++#include "userspace-tso-segsz.h"
+ #include "util.h"
+ #include "unixctl.h"
+ #include "lib/vswitch-idl.h"
+@@ -3298,6 +3299,7 @@ bridge_run(void)
+         dpdk_init(&cfg->other_config);
+         userspace_tso_init(&cfg->other_config);
+         userspace_sock_buf_size_init(&cfg->other_config);
++        userspace_tso_segsz_init(&cfg->other_config);
+     }
+ 
+     /* Initialize the ofproto library.  This only needs to run once, but
+-- 
+2.17.1
+

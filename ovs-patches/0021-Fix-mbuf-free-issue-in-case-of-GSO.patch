@@ -1,0 +1,99 @@
+From b782fdfbf18986aee141b0afb6bf4d122f80d788 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 22 Oct 2020 04:21:43 -0400
+Subject: [PATCH 21/47] Fix mbuf free issue in case of GSO
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 48 ++++++++++++++++-------------------------------
+ 1 file changed, 16 insertions(+), 32 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 7d19deeb2..8c4c938f2 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2719,9 +2719,12 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+                                       /* gso output mbufs */
+                                       (struct rte_mbuf **)&gso_mbufs,
+                                       MAX_GSO_MBUFS);
+-                if (ret < 0) {
+-                    rte_pktmbuf_free(pkts[i]);
+-                } else {
++                /* pkts[i] can be freed safely here, it is responsibility of
++                 * the caller of rte_gso_segment to free pkts[i],
++                 * rte_gso_segment won't free pkts[i].
++                 */
++                rte_pktmbuf_free(pkts[i]);
++                if (ret >= 0) {
+                     int j, k;
+                     struct rte_mbuf * next_part;
+ 
+@@ -3350,24 +3353,13 @@ out:
+     }
+ }
+ 
+-struct shinfo_arg {
+-    void * buf;
+-    struct rte_mbuf *mbuf;
+-};
+-
+ /* For GSO case, the extended mbuf only can be freed by
+  * netdev_dpdk_extbuf_free
+  */
+ static void
+ netdev_dpdk_extbuf_free(struct rte_mbuf *m, void *opaque)
+ {
+-    struct shinfo_arg *arg = (struct shinfo_arg *)opaque;
+-
+-    rte_free(arg->buf);
+-    if (m != arg->mbuf) {
+-        rte_pktmbuf_free(arg->mbuf);
+-    }
+-    free(arg);
++    rte_free(opaque);
+ }
+ 
+ static struct rte_mbuf *
+@@ -3377,6 +3369,7 @@ dpdk_pktmbuf_attach_extbuf(struct rte_mbuf *pkt, uint32_t data_len)
+     struct rte_mbuf_ext_shared_info *shinfo = NULL;
+     uint16_t buf_len;
+     void *buf;
++    struct shinfo_arg *arg;
+ 
+     if (rte_pktmbuf_tailroom(pkt) >= sizeof *shinfo) {
+         shinfo = rte_pktmbuf_mtod(pkt, struct rte_mbuf_ext_shared_info *);
+@@ -3398,23 +3391,14 @@ dpdk_pktmbuf_attach_extbuf(struct rte_mbuf *pkt, uint32_t data_len)
+     }
+ 
+     /* Initialize shinfo. */
+-    if (shinfo) {
+-        struct shinfo_arg *arg = xmalloc(sizeof(struct shinfo_arg));
+-        arg->buf = buf;
+-        arg->mbuf = pkt;
+-        shinfo->free_cb = netdev_dpdk_extbuf_free;
+-        shinfo->fcb_opaque = arg;
+-        rte_mbuf_ext_refcnt_set(shinfo, 1);
+-    } else {
+-        shinfo = rte_pktmbuf_ext_shinfo_init_helper(buf, &buf_len,
+-                                                    netdev_dpdk_extbuf_free,
+-                                                    buf);
+-        if (OVS_UNLIKELY(shinfo == NULL)) {
+-            rte_free(buf);
+-            VLOG_ERR("Failed to initialize shared info for mbuf while "
+-                     "attempting to attach an external buffer.");
+-            return NULL;
+-        }
++    shinfo = rte_pktmbuf_ext_shinfo_init_helper(buf, &buf_len,
++                                                netdev_dpdk_extbuf_free,
++                                                buf);
++    if (OVS_UNLIKELY(shinfo == NULL)) {
++        rte_free(buf);
++        VLOG_ERR("Failed to initialize shared info for mbuf while "
++                 "attempting to attach an external buffer.");
++        return NULL;
+     }
+ 
+     rte_pktmbuf_attach_extbuf(pkt, buf, rte_malloc_virt2iova(buf), buf_len,
+-- 
+2.17.1
+

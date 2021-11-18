@@ -1,0 +1,176 @@
+From 8d7690a8f47e42f1bb3561b2defdafe8c13c3a63 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 14 Jan 2021 22:05:08 -0500
+Subject: [PATCH 42/47] userspace: add userspace-vxlan-port to other_config
+
+Sometimes vxlan port isn't 4789, netdev-dpdk needs to know this
+in order that it can parse vxlan packet correctly, so add
+userspace-vxlan-port to other_config.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/automake.mk            |  2 ++
+ lib/netdev-dpdk.c          |  6 ++---
+ lib/userspace-vxlan-port.c | 48 ++++++++++++++++++++++++++++++++++++++
+ lib/userspace-vxlan-port.h | 23 ++++++++++++++++++
+ vswitchd/bridge.c          |  2 ++
+ 5 files changed, 78 insertions(+), 3 deletions(-)
+ create mode 100644 lib/userspace-vxlan-port.c
+ create mode 100644 lib/userspace-vxlan-port.h
+
+diff --git a/lib/automake.mk b/lib/automake.mk
+index af85ccafb..f689a0c71 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -349,6 +349,8 @@ lib_libopenvswitch_la_SOURCES = \
+ 	lib/userspace-tso.h \
+ 	lib/userspace-tso-segsz.c \
+ 	lib/userspace-tso-segsz.h \
++	lib/userspace-vxlan-port.c \
++	lib/userspace-vxlan-port.h \
+ 	lib/util.c \
+ 	lib/util.h \
+ 	lib/uuid.c \
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index d055be015..0b30c2647 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -78,6 +78,7 @@
+ #include "unixctl.h"
+ #include "userspace-tso.h"
+ #include "userspace-tso-segsz.h"
++#include "userspace-vxlan-port.h"
+ #include "util.h"
+ #include "uuid.h"
+ 
+@@ -3102,8 +3103,6 @@ netdev_dpdk_vhost_rxq_enabled(struct netdev_rxq *rxq)
+     return dev->vhost_rxq_enabled[rxq->queue_id];
+ }
+ 
+-#define VXLAN_DST_PORT 4789
+-
+ static void
+ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+                       int *is_frag)
+@@ -3183,13 +3182,14 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+     } else if (*l4_proto == IPPROTO_UDP) {
+         struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)
+             ((char *)eth_hdr + l2_len + l3_len);
++        uint16_t vxlan_port = userspace_get_vxlan_port();
+ 
+         l4_len = sizeof(*udp_hdr);
+         dp_packet_hwol_set_l4_len(pkt, l4_len);
+         mbuf->packet_type |= RTE_PTYPE_L4_UDP;
+ 
+         /* Need to parse inner packet if needed */
+-        if (ntohs(udp_hdr->dst_port) == VXLAN_DST_PORT) {
++        if (ntohs(udp_hdr->dst_port) == vxlan_port) {
+             netdev_dpdk_parse_hdr(pkt,
+                                   l2_len + l3_len + l4_len
+                                       + sizeof(struct vxlanhdr),
+diff --git a/lib/userspace-vxlan-port.c b/lib/userspace-vxlan-port.c
+new file mode 100644
+index 000000000..7d6a3fa32
+--- /dev/null
++++ b/lib/userspace-vxlan-port.c
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (c) 2021 Inspur Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include "smap.h"
++#include "ovs-thread.h"
++#include "openvswitch/vlog.h"
++#include "dpdk.h"
++#include "userspace-vxlan-port.h"
++#include "vswitch-idl.h"
++
++VLOG_DEFINE_THIS_MODULE(userspace_vxlan_port);
++
++#define DEFAULT_VXLAN_PORT 4789
++static uint16_t userspace_vxlan_port = DEFAULT_VXLAN_PORT;
++
++void
++userspace_vxlan_port_init(const struct smap *ovs_other_config)
++{
++    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
++    if (ovsthread_once_start(&once)) {
++        userspace_vxlan_port = smap_get_int(ovs_other_config,
++                                            "userspace-vxlan-port",
++                                            DEFAULT_VXLAN_PORT);
++        VLOG_INFO("Userspace VXLAN port: %u", userspace_vxlan_port);
++        ovsthread_once_done(&once);
++    }
++}
++
++uint16_t
++userspace_get_vxlan_port(void)
++{
++    return userspace_vxlan_port;
++}
+diff --git a/lib/userspace-vxlan-port.h b/lib/userspace-vxlan-port.h
+new file mode 100644
+index 000000000..d90b2db17
+--- /dev/null
++++ b/lib/userspace-vxlan-port.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2021 Inspur Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef USERSPACE_VXLAN_PORT_H
++#define USERSPACE_VXLAN_PORT_H 1
++
++void userspace_vxlan_port_init(const struct smap *ovs_other_config);
++uint16_t userspace_get_vxlan_port(void);
++
++#endif /* userspace-vxlan-port.h */
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index 04bef2aae..6d0ac2ae9 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -68,6 +68,7 @@
+ #include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
+ #include "userspace-tso-segsz.h"
++#include "userspace-vxlan-port.h"
+ #include "util.h"
+ #include "unixctl.h"
+ #include "lib/vswitch-idl.h"
+@@ -3302,6 +3303,7 @@ bridge_run(void)
+         userspace_tso_init(&cfg->other_config);
+         userspace_sock_buf_size_init(&cfg->other_config);
+         userspace_tso_segsz_init(&cfg->other_config);
++        userspace_vxlan_port_init(&cfg->other_config);
+     }
+ 
+     /* Initialize the ofproto library.  This only needs to run once, but
+-- 
+2.17.1
+

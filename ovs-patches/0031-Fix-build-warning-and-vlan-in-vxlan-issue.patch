@@ -1,0 +1,90 @@
+From 23cd2e8a7deed8f84701b9916e5f6d0e1f8a8899 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 26 Nov 2020 22:13:31 -0500
+Subject: [PATCH 31/47] Fix build warning and vlan in vxlan issue
+
+Note: warning: udp_hdr may be used uninitialized.
+      ip_hdr should be ((char *) eth + mbuf->l2).
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 38 ++++++++++++++++++++------------------
+ 1 file changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 639dd50b7..920d85018 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2228,7 +2228,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      */
+     if ((mbuf->outer_l2_len != 0) && (mbuf->outer_l3_len != 0) &&
+         ((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
+-        (mbuf->l2_len == UDP_VXLAN_ETH_HDR_SIZE)) {
++        (mbuf->l2_len >= UDP_VXLAN_ETH_HDR_SIZE)) {
+         mbuf->outer_l2_len = 0;
+         mbuf->outer_l3_len = 0;
+         mbuf->ol_flags = 0;
+@@ -2238,12 +2238,12 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         if (mbuf->l3_len == IP_HEADER_LEN) {
+             mbuf->ol_flags |= PKT_TX_IPV4;
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+-            ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
++            ip_hdr = (struct rte_ipv4_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip_hdr->next_proto_id;
+         } else if (mbuf->l3_len == IPV6_HEADER_LEN) {
+             /* Note: no IP checksum for IPv6 */
+             mbuf->ol_flags |= PKT_TX_IPV6;
+-            ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
++            ip6_hdr = (struct rte_ipv6_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
+         }
+ 
+@@ -2270,7 +2270,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ 
+     if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
+         /* Handle VXLAN TSO */
+-        struct rte_udp_hdr *udp_hdr;
++        struct rte_udp_hdr *udp_hdr = NULL;
+ 
+         /* Correct l2_len for VxLAN packet */
+         mbuf->l2_len += sizeof(struct udp_header)
+@@ -2323,20 +2323,22 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         }
+ 
+         /* Handle inner packet */
+-        if (mbuf->ol_flags & PKT_TX_IPV4) {
+-            ip_hdr = (struct rte_ipv4_hdr *)
+-                ((uint8_t *)udp_hdr + mbuf->l2_len);
+-            l4_proto = ip_hdr->next_proto_id;
+-            l3_hdr_ptr = (uint8_t *)ip_hdr;
+-
+-            /* inner IP checksum offload */
+-            ip_hdr->hdr_checksum = 0;
+-            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+-        } else if (mbuf->ol_flags & PKT_TX_IPV6) {
+-            ip6_hdr = (struct rte_ipv6_hdr *)
+-                ((uint8_t *)udp_hdr + mbuf->l2_len);
+-            l4_proto = ip6_hdr->proto;
+-            l3_hdr_ptr = (uint8_t *)ip6_hdr;
++        if (udp_hdr != NULL) {
++            if (mbuf->ol_flags & PKT_TX_IPV4) {
++                ip_hdr = (struct rte_ipv4_hdr *)
++                    ((uint8_t *)udp_hdr + mbuf->l2_len);
++                l4_proto = ip_hdr->next_proto_id;
++                l3_hdr_ptr = (uint8_t *)ip_hdr;
++
++                /* inner IP checksum offload */
++                ip_hdr->hdr_checksum = 0;
++                mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++            } else if (mbuf->ol_flags & PKT_TX_IPV6) {
++                ip6_hdr = (struct rte_ipv6_hdr *)
++                    ((uint8_t *)udp_hdr + mbuf->l2_len);
++                l4_proto = ip6_hdr->proto;
++                l3_hdr_ptr = (uint8_t *)ip6_hdr;
++            }
+         }
+ 
+         /* In case of MTU > tso_segsz, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't
+-- 
+2.17.1
+

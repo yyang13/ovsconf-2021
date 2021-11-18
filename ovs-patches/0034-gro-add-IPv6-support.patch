@@ -1,0 +1,47 @@
+From 0544bae48d955b532d851096459ef8643a1788ca Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 24 Dec 2020 03:35:37 -0500
+Subject: [PATCH 34/47] gro: add IPv6 support
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 1db82291d..d92f2afd5 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -3165,7 +3165,15 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
+         gro_param.gro_types = RTE_GRO_TCP_IPV4 |
+                               RTE_GRO_UDP_IPV4 |
+                               RTE_GRO_IPV4_VXLAN_TCP_IPV4 |
+-                              RTE_GRO_IPV4_VXLAN_UDP_IPV4;
++                              RTE_GRO_IPV4_VXLAN_UDP_IPV4 |
++                              RTE_GRO_TCP_IPV6 |
++                              RTE_GRO_IPV4_VXLAN_TCP_IPV6 |
++                              RTE_GRO_IPV6_VXLAN_TCP_IPV4 |
++                              RTE_GRO_IPV6_VXLAN_TCP_IPV6 |
++                              RTE_GRO_UDP_IPV6 |
++                              RTE_GRO_IPV4_VXLAN_UDP_IPV6 |
++                              RTE_GRO_IPV6_VXLAN_UDP_IPV4 |
++                              RTE_GRO_IPV6_VXLAN_UDP_IPV6;
+         gro_param.max_flow_num = 1024;
+         /* There are 46 fragments for a 64K big packet */
+         gro_param.max_item_per_flow = NETDEV_MAX_BURST * 2;
+@@ -3244,7 +3252,11 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
+                                            nb_udp_rx, RTE_PER_LCORE(_gro_ctx));
+             nb_udp_rx += rte_gro_timeout_flush(RTE_PER_LCORE(_gro_ctx), 10000,
+                               RTE_GRO_UDP_IPV4
+-                                  | RTE_GRO_IPV4_VXLAN_UDP_IPV4,
++                                  | RTE_GRO_IPV4_VXLAN_UDP_IPV4
++                                  | RTE_GRO_UDP_IPV6
++                                  | RTE_GRO_IPV4_VXLAN_UDP_IPV6
++                                  | RTE_GRO_IPV6_VXLAN_UDP_IPV4
++                                  | RTE_GRO_IPV6_VXLAN_UDP_IPV6,
+                               (struct rte_mbuf **)&udp_pkts[nb_udp_rx],
+                               NETDEV_MAX_BURST - nb_udp_rx);
+         }
+-- 
+2.17.1
+

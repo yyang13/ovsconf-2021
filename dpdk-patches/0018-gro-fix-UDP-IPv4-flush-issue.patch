@@ -1,0 +1,141 @@
+From b298bdf7ce2ea71376f8c4f080a6edc2cc021621 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Fri, 15 Jan 2021 04:48:55 -0500
+Subject: [PATCH 18/19] gro: fix UDP/IPv4 flush issue
+
+Note: if a UDP packet has been reassembled, it can be flushed
+immediately.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/librte_gro/gro_udp4.c | 33 ++++++++++++++++++++++++++-------
+ lib/librte_gro/gro_udp4.h |  1 +
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/lib/librte_gro/gro_udp4.c b/lib/librte_gro/gro_udp4.c
+index b8301296df..ceffa32d21 100644
+--- a/lib/librte_gro/gro_udp4.c
++++ b/lib/librte_gro/gro_udp4.c
+@@ -42,7 +42,7 @@ gro_udp4_tbl_create(uint16_t socket_id,
+ 	}
+ 	tbl->max_item_num = entries_num;
+ 
+-	size = sizeof(struct gro_udp4_flow) * entries_num;
++	size = sizeof(struct gro_udp4_flow) * max_flow_num;
+ 	tbl->flows = rte_zmalloc_socket(__func__,
+ 			size,
+ 			RTE_CACHE_LINE_SIZE,
+@@ -53,9 +53,9 @@ gro_udp4_tbl_create(uint16_t socket_id,
+ 		return NULL;
+ 	}
+ 	/* INVALID_ARRAY_INDEX indicates an empty flow */
+-	for (i = 0; i < entries_num; i++)
++	for (i = 0; i < max_flow_num; i++)
+ 		tbl->flows[i].start_index = INVALID_ARRAY_INDEX;
+-	tbl->max_flow_num = entries_num;
++	tbl->max_flow_num = max_flow_num;
+ 
+ 	return tbl;
+ }
+@@ -156,6 +156,7 @@ insert_new_flow(struct gro_udp4_tbl *tbl,
+ 	if (unlikely(flow_idx == INVALID_ARRAY_INDEX))
+ 		return INVALID_ARRAY_INDEX;
+ 
++	tbl->flows[flow_idx].head_tail = 0;
+ 	dst = &(tbl->flows[flow_idx].key);
+ 
+ 	rte_ether_addr_copy(&(src->eth_saddr), &(dst->eth_saddr));
+@@ -263,13 +264,15 @@ gro_udp4_reassemble(struct rte_mbuf *pkt,
+ 	 * packet into the flow.
+ 	 */
+ 	if (find == 0) {
++		uint32_t flow_idx;
++
+ 		item_idx = insert_new_item(tbl, pkt, start_time,
+ 				INVALID_ARRAY_INDEX, frag_offset,
+ 				is_last_frag);
+ 		if (unlikely(item_idx == INVALID_ARRAY_INDEX))
+ 			return -1;
+-		if (insert_new_flow(tbl, &key, item_idx) ==
+-				INVALID_ARRAY_INDEX) {
++		flow_idx = insert_new_flow(tbl, &key, item_idx);
++		if (flow_idx == INVALID_ARRAY_INDEX) {
+ 			/*
+ 			 * Fail to insert a new flow, so delete the
+ 			 * stored packet.
+@@ -277,6 +280,8 @@ gro_udp4_reassemble(struct rte_mbuf *pkt,
+ 			delete_item(tbl, item_idx, INVALID_ARRAY_INDEX);
+ 			return -1;
+ 		}
++		if ((frag_offset == 0) || is_last_frag)
++			tbl->flows[flow_idx].head_tail = 1;
+ 		return 0;
+ 	}
+ 
+@@ -292,8 +297,12 @@ gro_udp4_reassemble(struct rte_mbuf *pkt,
+ 		if (cmp) {
+ 			if (merge_two_udp4_packets(&(tbl->items[cur_idx]),
+ 						pkt, cmp, frag_offset,
+-						is_last_frag, 0))
++						is_last_frag, 0)) {
++				if ((frag_offset == 0) || is_last_frag)
++					tbl->flows[i].head_tail += 1;
+ 				return 1;
++			}
++
+ 			/*
+ 			 * Fail to merge the two packets, as the packet
+ 			 * length is greater than the max value. Store
+@@ -303,6 +312,8 @@ gro_udp4_reassemble(struct rte_mbuf *pkt,
+ 						frag_offset, is_last_frag) ==
+ 					INVALID_ARRAY_INDEX)
+ 				return -1;
++			if ((frag_offset == 0) || is_last_frag)
++				tbl->flows[i].head_tail += 1;
+ 			return 0;
+ 		}
+ 
+@@ -326,11 +337,15 @@ gro_udp4_reassemble(struct rte_mbuf *pkt,
+ 			return -1;
+ 		tbl->items[item_idx].next_pkt_idx = cur_idx;
+ 		tbl->flows[i].start_index = item_idx;
++		if ((frag_offset == 0) || is_last_frag)
++			tbl->flows[i].head_tail += 1;
+ 	} else {
+ 		if (insert_new_item(tbl, pkt, start_time, prev_idx,
+ 				frag_offset, is_last_frag)
+ 			== INVALID_ARRAY_INDEX)
+ 			return -1;
++		if ((frag_offset == 0) || is_last_frag)
++			tbl->flows[i].head_tail += 1;
+ 	}
+ 
+ 	return 0;
+@@ -391,7 +406,11 @@ gro_udp4_tbl_timeout_flush(struct gro_udp4_tbl *tbl,
+ 
+ 		j = tbl->flows[i].start_index;
+ 		while (j != INVALID_ARRAY_INDEX) {
+-			if (tbl->items[j].start_time <= flush_timestamp) {
++			/* The flow will be flushed if it is expired or
++			 * has been reassembled successfully.
++			 */
++			if ((tbl->flows[i].head_tail == 2) ||
++			    (tbl->items[j].start_time <= flush_timestamp)) {
+ 				gro_udp4_merge_items(tbl, j);
+ 				out[k++] = tbl->items[j].firstseg;
+ 				if (tbl->items[j].nb_merged > 1)
+diff --git a/lib/librte_gro/gro_udp4.h b/lib/librte_gro/gro_udp4.h
+index d38b393f79..922d3c186c 100644
+--- a/lib/librte_gro/gro_udp4.h
++++ b/lib/librte_gro/gro_udp4.h
+@@ -38,6 +38,7 @@ struct gro_udp4_flow {
+ 	 * INVALID_ARRAY_INDEX indicates an empty flow.
+ 	 */
+ 	uint32_t start_index;
++	uint32_t head_tail;
+ };
+ 
+ struct gro_udp4_item {
+-- 
+2.17.1
+

@@ -1,0 +1,33 @@
+From b1198ce537b5a65fc3ddd84ef091cb57c851027c Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Tue, 27 Apr 2021 05:44:06 -0400
+Subject: [PATCH 46/47] Fix a tpacket bug
+
+In some cases, tpacket_recv_v2 can't allocate DPDK
+rte_mbuf, so buffer must be checked, if it is NULL,
+won't receive packets.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-linux.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 78c2623ac..1b07c8f8a 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -4457,6 +4457,11 @@ netdev_linux_batch_recv_tpacket_v2(struct netdev_rxq_linux *rx, bool tso,
+                      ppd->tp_snaplen + virtio_net_hdr_size
+                          + VLAN_ETH_HEADER_LEN, DP_NETDEV_HEADROOM);
+ #endif
++        /* It can't get buffer in some cases, so must check it here. */
++        if (buffer == NULL) {
++            break;
++        }
++
+         memcpy(dp_packet_data(buffer), (uint8_t *)ppd + ppd->tp_mac
+                                            - virtio_net_hdr_size,
+                ppd->tp_snaplen + virtio_net_hdr_size);
+-- 
+2.17.1
+

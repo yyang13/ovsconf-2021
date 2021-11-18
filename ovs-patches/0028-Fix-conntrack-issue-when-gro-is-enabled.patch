@@ -1,0 +1,96 @@
+From 48edeb80b65ca98fc64136eedde3620680624a13 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 19 Nov 2020 22:13:02 -0500
+Subject: [PATCH 28/47] Fix conntrack issue when gro is enabled
+
+Note: after GROed, the packet has bad ip checksum
+and tcp checksum, conntrack shouldn't check them
+in GRO case. In addition, big UDP packet has same
+issue if UDF is eanbled, conntrack also shouldn't
+check them.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/conntrack.c | 12 ++++++++++--
+ lib/dp-packet.h | 14 ++++++++++++++
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/lib/conntrack.c b/lib/conntrack.c
+index f42ba4b60..26ef8cdb3 100644
+--- a/lib/conntrack.c
++++ b/lib/conntrack.c
+@@ -40,6 +40,7 @@
+ #include "openvswitch/poll-loop.h"
+ #include "random.h"
+ #include "timeval.h"
++#include "userspace-tso-segsz.h"
+ 
+ VLOG_DEFINE_THIS_MODULE(conntrack);
+ 
+@@ -1994,6 +1995,7 @@ conn_key_extract(struct conntrack *ct, struct dp_packet *pkt, ovs_be16 dl_type,
+     const struct eth_header *l2 = dp_packet_eth(pkt);
+     const struct ip_header *l3 = dp_packet_l3(pkt);
+     const char *l4 = dp_packet_l4(pkt);
++    const uint16_t tso_segsz = get_userspace_tso_segsz();
+ 
+     memset(ctx, 0, sizeof *ctx);
+ 
+@@ -2044,7 +2046,10 @@ conn_key_extract(struct conntrack *ct, struct dp_packet *pkt, ovs_be16 dl_type,
+             ok = false;
+         } else {
+             bool hwol_good_l3_csum = dp_packet_ip_checksum_valid(pkt)
+-                                     || dp_packet_hwol_is_ipv4(pkt);
++                                     || dp_packet_hwol_is_ipv4(pkt)
++                                     || dp_packet_hwol_is_multiseg(pkt)
++                                     || (dp_packet_size(pkt) > (tso_segsz +
++                                             ((char *)l3 - (char *)l2)));
+             /* Validate the checksum only when hwol is not supported. */
+             ok = extract_l3_ipv4(&ctx->key, l3, dp_packet_l3_size(pkt), NULL,
+                                  !hwol_good_l3_csum);
+@@ -2059,7 +2064,10 @@ conn_key_extract(struct conntrack *ct, struct dp_packet *pkt, ovs_be16 dl_type,
+         bool hwol_bad_l4_csum = dp_packet_l4_checksum_bad(pkt);
+         if (!hwol_bad_l4_csum) {
+             bool  hwol_good_l4_csum = dp_packet_l4_checksum_valid(pkt)
+-                                      || dp_packet_hwol_tx_l4_checksum(pkt);
++                                      || dp_packet_hwol_tx_l4_checksum(pkt)
++                                      || dp_packet_hwol_is_multiseg(pkt)
++                                      || (dp_packet_size(pkt) > (tso_segsz +
++                                              ((char *)l3 - (char *)l2)));
+             /* Validate the checksum only when hwol is not supported. */
+             if (extract_l4(&ctx->key, l4, dp_packet_l4_size(pkt),
+                            &ctx->icmp_related, l3, !hwol_good_l4_csum,
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 8b4de4eed..39d051709 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -1215,6 +1215,13 @@ dp_packet_hwol_get_outer_l3_len(struct dp_packet *b)
+     return b->mbuf.outer_l3_len;
+ }
+ 
++/* Check if packet 'b' is multisegmented */
++static inline bool
++dp_packet_hwol_is_multiseg(struct dp_packet *b)
++{
++    return (b->mbuf.nb_segs > 1);
++}
++
+ #else
+ /* Mark packet 'b' for VXLAN TCP segmentation offloading. */
+ static inline void
+@@ -1288,6 +1295,13 @@ dp_packet_hwol_get_outer_l3_len(struct dp_packet *b)
+ {
+     return ((char *)dp_packet_l4(b) - (char *)dp_packet_l3(b));
+ }
++
++/* Check if packet 'b' is multisegmented */
++static inline bool
++dp_packet_hwol_is_multiseg(struct dp_packet *b)
++{
++    return false;
++}
+ #endif /* DPDK_NETDEV */
+ 
+ static inline bool
+-- 
+2.17.1
+

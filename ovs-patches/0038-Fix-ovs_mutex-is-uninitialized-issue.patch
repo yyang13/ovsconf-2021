@@ -1,0 +1,32 @@
+From 08f61c516170feba75e7092e8ffea99e1ba53209 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 14 Jan 2021 01:48:55 -0500
+Subject: [PATCH 38/47] Fix 'ovs_mutex is uninitialized' issue
+
+Note: sometimes vport netdev ovs_mutex isn't initialized
+, but will call mutex_lock(ovs_mutex), this is wrong, so
+just return 1 and drop packets.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-native-tnl.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/lib/netdev-native-tnl.c b/lib/netdev-native-tnl.c
+index b89dfdd52..b52fd9750 100644
+--- a/lib/netdev-native-tnl.c
++++ b/lib/netdev-native-tnl.c
+@@ -925,6 +925,10 @@ netdev_vxlan_build_header(const struct netdev *netdev,
+     struct vxlanhdr *vxh;
+ 
+     /* XXX: RCUfy tnl_cfg. */
++    if (OVS_UNLIKELY(!dev->mutex.where)) {
++        VLOG_INFO("vport %s mutex not initialized?", netdev->name);
++        return 1;
++    }
+     ovs_mutex_lock(&dev->mutex);
+     tnl_cfg = &dev->tnl_cfg;
+ 
+-- 
+2.17.1
+

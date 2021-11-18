@@ -1,0 +1,416 @@
+From ae05bd3ee320d1f81a08459c72ae584b6db080ae Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 9 Sep 2020 21:28:05 -0500
+Subject: [PATCH 07/47] Fix tap interface statistics issue
+
+After tap interface is moved to network namespace,
+"ovs-vsctl list interface tapXXX" can get statistics
+info of tap interface, the root cause is OVS still
+gets statistics info in root namespace.
+
+With netns option help, OVS can get statistics info
+in tap interface netns.
+
+This patch added enter and exit netns helpers and
+change statistics-related functions for those tap
+interfaces which have been moved into netns and
+make sure "ovs-vsctl list interface tapXXX" can
+get statistics info correctly.
+
+Here is a result sample for reference:
+name                : tap1
+ofport              : 4
+ofport_request      : []
+options             : {netns=ns01}
+other_config        : {}
+statistics          : {rx_bytes=6228, rx_packets=68, tx_bytes=8310, tx_packets=95}
+status              : {}
+type                : tap
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dpif-netlink.c   |  51 +++++++++++++++
+ lib/dpif-netlink.h   |   3 +
+ lib/netdev-linux.c   |  63 ++++++++++++++++++-
+ lib/netlink-socket.c | 146 +++++++++++++++++++++++++++++++++++++++++++
+ lib/netlink-socket.h |   2 +
+ 5 files changed, 263 insertions(+), 2 deletions(-)
+
+diff --git a/lib/dpif-netlink.c b/lib/dpif-netlink.c
+index 2f881e4fa..d8dd37f77 100644
+--- a/lib/dpif-netlink.c
++++ b/lib/dpif-netlink.c
+@@ -4237,6 +4237,43 @@ dpif_netlink_vport_transact(const struct dpif_netlink_vport *request,
+     return error;
+ }
+ 
++static int
++dpif_netlink_vport_transact_nopool(const struct dpif_netlink_vport *request,
++                                   struct dpif_netlink_vport *reply,
++                                   struct ofpbuf **bufp)
++{
++    struct ofpbuf *request_buf;
++    int error;
++
++    ovs_assert((reply != NULL) == (bufp != NULL));
++
++    error = dpif_netlink_init();
++    if (error) {
++        if (reply) {
++            *bufp = NULL;
++            dpif_netlink_vport_init(reply);
++        }
++        return error;
++    }
++
++    request_buf = ofpbuf_new(1024);
++    dpif_netlink_vport_to_ofpbuf(request, request_buf);
++    error = nl_transact_nopool(NETLINK_GENERIC, request_buf, bufp);
++    ofpbuf_delete(request_buf);
++
++    if (reply) {
++        if (!error) {
++            error = dpif_netlink_vport_from_ofpbuf(reply, *bufp);
++        }
++        if (error) {
++            dpif_netlink_vport_init(reply);
++            ofpbuf_delete(*bufp);
++            *bufp = NULL;
++        }
++    }
++    return error;
++}
++
+ /* Obtains information about the kernel vport named 'name' and stores it into
+  * '*reply' and '*bufp'.  The caller must free '*bufp' when the reply is no
+  * longer needed ('reply' will contain pointers into '*bufp').  */
+@@ -4253,6 +4290,20 @@ dpif_netlink_vport_get(const char *name, struct dpif_netlink_vport *reply,
+     return dpif_netlink_vport_transact(&request, reply, bufp);
+ }
+ 
++int
++dpif_netlink_vport_get_nopool(const char *name,
++                              struct dpif_netlink_vport *reply,
++                              struct ofpbuf **bufp)
++{
++    struct dpif_netlink_vport request;
++
++    dpif_netlink_vport_init(&request);
++    request.cmd = OVS_VPORT_CMD_GET;
++    request.name = name;
++
++    return dpif_netlink_vport_transact_nopool(&request, reply, bufp);
++}
++
+ /* Parses the contents of 'buf', which contains a "struct ovs_header" followed
+  * by Netlink attributes, into 'dp'.  Returns 0 if successful, otherwise a
+  * positive errno value.
+diff --git a/lib/dpif-netlink.h b/lib/dpif-netlink.h
+index 24294bc42..937224112 100644
+--- a/lib/dpif-netlink.h
++++ b/lib/dpif-netlink.h
+@@ -55,6 +55,9 @@ int dpif_netlink_vport_transact(const struct dpif_netlink_vport *request,
+                                 struct ofpbuf **bufp);
+ int dpif_netlink_vport_get(const char *name, struct dpif_netlink_vport *reply,
+                            struct ofpbuf **bufp);
++int dpif_netlink_vport_get_nopool(const char *name,
++                                  struct dpif_netlink_vport *reply,
++                                  struct ofpbuf **bufp);
+ 
+ bool dpif_netlink_is_internal_device(const char *name);
+ 
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index f84b91b4e..0ac5f9b13 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -521,8 +521,16 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
+  * changes in the device miimon status, so we can use atomic_count. */
+ static atomic_count miimon_cnt = ATOMIC_COUNT_INIT(0);
+ 
++struct netns_knob {
++    int main_fd;
++    int netns_fd;
++    char nspath[128];
++};
++
+ static int netdev_linux_parse_vnet_hdr(struct dp_packet *b);
+ static void netdev_linux_prepend_vnet_hdr(struct dp_packet *b, int mtu);
++static int enter_netns(struct netns_knob *netns_knob, const char *netns);
++static void exit_netns(struct netns_knob *netns_knob);
+ static int netdev_linux_do_ethtool(const char *name, struct ethtool_cmd *,
+                                    int cmd, const char *cmd_name);
+ static int get_flags(const struct netdev *, unsigned int *flags);
+@@ -2182,11 +2190,18 @@ netdev_stats_from_ovs_vport_stats(struct netdev_stats *dst,
+ static int
+ get_stats_via_vport__(const struct netdev *netdev, struct netdev_stats *stats)
+ {
++    struct netdev_linux *netdev_linux = netdev_linux_cast(netdev);
+     struct dpif_netlink_vport reply;
+     struct ofpbuf *buf;
+     int error;
+ 
+-    error = dpif_netlink_vport_get(netdev_get_name(netdev), &reply, &buf);
++    if (is_tap_netdev(netdev) && (netdev_linux->netns != NULL)) {
++        error = dpif_netlink_vport_get_nopool(netdev_get_name(netdev),
++                                              &reply, &buf);
++    } else {
++        error = dpif_netlink_vport_get(netdev_get_name(netdev),
++                                              &reply, &buf);
++    }
+     if (error) {
+         return error;
+     } else if (!reply.stats) {
+@@ -2261,6 +2276,33 @@ netdev_linux_get_stats(const struct netdev *netdev_,
+     return error;
+ }
+ 
++static int
++enter_netns(struct netns_knob *netns_knob, const char *netns)
++{
++    sprintf(netns_knob->nspath, "/proc/%d/ns/net", getpid());
++    netns_knob->main_fd = open(netns_knob->nspath, O_RDONLY);
++    if (netns_knob->main_fd < 0) {
++        return errno;
++    }
++
++    sprintf(netns_knob->nspath, "/var/run/netns/%s", netns);
++    netns_knob->netns_fd = open(netns_knob->nspath, O_RDONLY);
++    if (netns_knob->netns_fd < 0) {
++        close(netns_knob->main_fd);
++        return errno;
++    }
++    setns(netns_knob->netns_fd, CLONE_NEWNET);
++    return 0;
++}
++
++static void
++exit_netns(struct netns_knob *netns_knob)
++{
++    setns(netns_knob->main_fd, CLONE_NEWNET);
++    close(netns_knob->netns_fd);
++    close(netns_knob->main_fd);
++}
++
+ /* Retrieves current device stats for 'netdev-tap' netdev or
+  * netdev-internal. */
+ static int
+@@ -2269,6 +2311,14 @@ netdev_tap_get_stats(const struct netdev *netdev_, struct netdev_stats *stats)
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     struct netdev_stats dev_stats;
+     int error;
++    struct netns_knob netns_knob;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     get_stats_via_vport(netdev_, stats);
+@@ -2322,6 +2372,10 @@ netdev_tap_get_stats(const struct netdev *netdev_, struct netdev_stats *stats)
+     stats->rx_dropped += netdev->rx_dropped;
+     ovs_mutex_unlock(&netdev->mutex);
+ 
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -6269,6 +6323,7 @@ netdev_stats_from_rtnl_link_stats64(struct netdev_stats *dst,
+ int
+ get_stats_via_netlink(const struct netdev *netdev_, struct netdev_stats *stats)
+ {
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     struct ofpbuf request;
+     struct ofpbuf *reply;
+     int error;
+@@ -6282,7 +6337,11 @@ get_stats_via_netlink(const struct netdev *netdev_, struct netdev_stats *stats)
+                         RTM_GETLINK, NLM_F_REQUEST);
+     ofpbuf_put_zeros(&request, sizeof(struct ifinfomsg));
+     nl_msg_put_string(&request, IFLA_IFNAME, netdev_get_name(netdev_));
+-    error = nl_transact(NETLINK_ROUTE, &request, &reply);
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        error = nl_transact_nopool(NETLINK_ROUTE, &request, &reply);
++    } else {
++        error = nl_transact(NETLINK_ROUTE, &request, &reply);
++    }
+     ofpbuf_uninit(&request);
+     if (error) {
+         return error;
+diff --git a/lib/netlink-socket.c b/lib/netlink-socket.c
+index 47077e947..2377ca7ec 100644
+--- a/lib/netlink-socket.c
++++ b/lib/netlink-socket.c
+@@ -1807,6 +1807,152 @@ nl_transact(int protocol, const struct ofpbuf *request,
+     return error;
+ }
+ 
++static int
++nl_sock_create_nopool(int protocol, struct nl_sock **sockp)
++{
++    struct nl_sock *sock;
++#ifndef _WIN32
++    struct sockaddr_nl local, remote;
++#endif
++    socklen_t local_size;
++    int rcvbuf;
++    int retval = 0;
++
++    *sockp = NULL;
++    sock = xmalloc(sizeof *sock);
++
++#ifdef _WIN32
++    sock->overlapped.hEvent = NULL;
++    sock->handle = CreateFile(OVS_DEVICE_NAME_USER,
++                              GENERIC_READ | GENERIC_WRITE,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE,
++                              NULL, OPEN_EXISTING,
++                              FILE_FLAG_OVERLAPPED, NULL);
++
++    if (sock->handle == INVALID_HANDLE_VALUE) {
++        VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
++        goto error;
++    }
++
++    memset(&sock->overlapped, 0, sizeof sock->overlapped);
++    sock->overlapped.hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
++    if (sock->overlapped.hEvent == NULL) {
++        VLOG_ERR("fcntl: %s", ovs_lasterror_to_string());
++        goto error;
++    }
++    /* Initialize the type/ioctl to Generic */
++    sock->read_ioctl = OVS_IOCTL_READ;
++#else
++    sock->fd = socket(AF_NETLINK, SOCK_RAW, protocol);
++    if (sock->fd < 0) {
++        VLOG_ERR("fcntl: %s", ovs_strerror(errno));
++        goto error;
++    }
++#endif
++
++    sock->protocol = protocol;
++    sock->next_seq = 1;
++
++    rcvbuf = 1024 * 1024;
++#ifdef _WIN32
++    sock->rcvbuf = rcvbuf;
++    retval = get_sock_pid_from_kernel(sock);
++    if (retval != 0) {
++        goto error;
++    }
++    retval = set_sock_property(sock);
++    if (retval != 0) {
++        goto error;
++    }
++#else
++    if (setsockopt(sock->fd, SOL_SOCKET, SO_RCVBUFFORCE,
++                   &rcvbuf, sizeof rcvbuf)) {
++        /* Only root can use SO_RCVBUFFORCE.  Everyone else gets EPERM.
++         * Warn only if the failure is therefore unexpected. */
++        if (errno != EPERM) {
++            VLOG_WARN_RL(&rl, "setting %d-byte socket receive buffer failed "
++                         "(%s)", rcvbuf, ovs_strerror(errno));
++        }
++    }
++
++    retval = get_socket_rcvbuf(sock->fd);
++    if (retval < 0) {
++        retval = -retval;
++        goto error;
++    }
++    sock->rcvbuf = retval;
++    retval = 0;
++
++    /* Connect to kernel (pid 0) as remote address. */
++    memset(&remote, 0, sizeof remote);
++    remote.nl_family = AF_NETLINK;
++    remote.nl_pid = 0;
++    if (connect(sock->fd, (struct sockaddr *) &remote, sizeof remote) < 0) {
++        VLOG_ERR("connect(0): %s", ovs_strerror(errno));
++        goto error;
++    }
++
++    /* Obtain pid assigned by kernel. */
++    local_size = sizeof local;
++    if (getsockname(sock->fd, (struct sockaddr *) &local, &local_size) < 0) {
++        VLOG_ERR("getsockname: %s", ovs_strerror(errno));
++        goto error;
++    }
++    if (local_size < sizeof local || local.nl_family != AF_NETLINK) {
++        VLOG_ERR("getsockname returned bad Netlink name");
++        retval = EINVAL;
++        goto error;
++    }
++    sock->pid = local.nl_pid;
++#endif
++
++    *sockp = sock;
++    return 0;
++
++error:
++    if (retval == 0) {
++        retval = errno;
++        if (retval == 0) {
++            retval = EINVAL;
++        }
++    }
++#ifdef _WIN32
++    if (sock->overlapped.hEvent) {
++        CloseHandle(sock->overlapped.hEvent);
++    }
++    if (sock->handle != INVALID_HANDLE_VALUE) {
++        CloseHandle(sock->handle);
++    }
++#else
++    if (sock->fd >= 0) {
++        close(sock->fd);
++    }
++#endif
++    free(sock);
++    return retval;
++}
++
++int
++nl_transact_nopool(int protocol, const struct ofpbuf *request,
++            struct ofpbuf **replyp)
++{
++    struct nl_sock *sock;
++    int error;
++
++    error = nl_sock_create_nopool(protocol, &sock);
++    if (error) {
++        if (replyp) {
++            *replyp = NULL;
++        }
++        return error;
++    }
++
++    error = nl_sock_transact(sock, request, replyp);
++    nl_sock_destroy(sock);
++
++    return error;
++}
++
+ /* Sends the 'request' member of the 'n' transactions in 'transactions' on a
+  * Netlink socket for the given 'protocol' (e.g. NETLINK_ROUTE or
+  * NETLINK_GENERIC), in order, and receives responses to all of them.  Fills in
+diff --git a/lib/netlink-socket.h b/lib/netlink-socket.h
+index 7852ad052..08cbab844 100644
+--- a/lib/netlink-socket.h
++++ b/lib/netlink-socket.h
+@@ -254,6 +254,8 @@ struct nl_transaction {
+ int nl_transact(int protocol, const struct ofpbuf *request,
+                 struct ofpbuf **replyp);
+ void nl_transact_multiple(int protocol, struct nl_transaction **, size_t n);
++int nl_transact_nopool(int protocol, const struct ofpbuf *request,
++                       struct ofpbuf **replyp);
+ 
+ /* Table dumping. */
+ #define NL_DUMP_BUFSIZE         4096
+-- 
+2.17.1
+

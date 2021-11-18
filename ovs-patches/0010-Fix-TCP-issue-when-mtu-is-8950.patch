@@ -1,0 +1,37 @@
+From cf7aa6f2574cb2c47d9d97824c3ed73d45a6d526 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 23 Aug 2020 20:53:12 -0400
+Subject: [PATCH 10/47] Fix TCP issue when mtu is 8950
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index f44cd27fa..dff71c0fb 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2308,6 +2308,19 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             /* inner IP checksum offload offload */
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
++
++        /* In case of MTU > 1450, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't
++         * set by client/server, here is a place we can mark it.
++         */
++        if ((mbuf->pkt_len > 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
++                + mbuf->l2_len)
++            && (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)))) {
++            if (l4_proto == IPPROTO_UDP) {
++                mbuf->ol_flags |= PKT_TX_UDP_SEG;
++            } else if (l4_proto == IPPROTO_TCP) {
++                mbuf->ol_flags |= PKT_TX_TCP_SEG;
++            }
++        }
+     } else if (mbuf->ol_flags & (PKT_TX_IPV4 | PKT_TX_IPV6)) {
+         /* Handle VLAN TSO */
+             /* no inner IP checksum for IPV6 */
+-- 
+2.17.1
+

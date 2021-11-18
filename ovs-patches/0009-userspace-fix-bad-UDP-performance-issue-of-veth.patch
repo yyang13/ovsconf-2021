@@ -1,0 +1,602 @@
+From 48b4df3c2a851b3607b937a19ec0eb19e6d2e22e Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 7 Sep 2020 22:01:10 -0500
+Subject: [PATCH 09/47] userspace: fix bad UDP performance issue of veth
+
+iperf3 UDP performance of veth to veth case is
+very very bad because of too many packet loss,
+the root cause is rmem_default and wmem_default
+are just 212992, but iperf3 UDP test used 8K
+UDP size which resulted in many UDP fragment in
+case that MTU size is 1500, one 8K UDP send would
+enqueue 6 UDP fragments to socket receive queue,
+the default small socket buffer size can't cache
+so many packets that many packets are lost.
+
+This commit fixed packet loss issue, it allows
+users to set socket receive and send buffer size
+per their own system environment to proper value,
+therefore there will not be packet loss.
+
+Users can set system interface socket buffer size
+by command lines:
+
+  $ sudo sh -c "1073741823 > /proc/sys/net/core/wmem_max"
+  $ sudo sh -c "1073741823 > /proc/sys/net/core/rmem_max"
+
+or
+
+  $ sudo ovs-vsctl set Open_vSwitch . \
+        other_config:userspace-sock-buf-size=1073741823
+
+But final socket buffer size is minimum one among of them.
+Possible value range is 212992 to 1073741823. Current
+default value for other_config:userspace-sock-buf-size is
+212992, users need to increase it to improve UDP
+performance, the changed value will take effect after
+restarting ovs-vswitchd. More details about it is in the
+document
+Documentation/howto/userspace-udp-performance-tunning.rst.
+
+By the way, big socket buffer doesn't mean it will
+allocate big buffer on creating socket, actually
+it won't alocate any extra buffer compared to default
+socket buffer size, it just means more skbuffs can
+be enqueued to socket receive queue and send queue,
+therefore there will not be packet loss.
+
+The below is for your reference.
+
+The result before apply this commit
+===================================
+$ ip netns exec ns02 iperf3 -t 5 -i 1 -u -b 100M -c 10.15.2.6 --get-server-output -A 5
+Connecting to host 10.15.2.6, port 5201
+[  4] local 10.15.2.2 port 59053 connected to 10.15.2.6 port 5201
+[ ID] Interval           Transfer     Bandwidth       Total Datagrams
+[  4]   0.00-1.00   sec  10.8 MBytes  90.3 Mbits/sec  1378
+[  4]   1.00-2.00   sec  11.9 MBytes   100 Mbits/sec  1526
+[  4]   2.00-3.00   sec  11.9 MBytes   100 Mbits/sec  1526
+[  4]   3.00-4.00   sec  11.9 MBytes   100 Mbits/sec  1526
+[  4]   4.00-5.00   sec  11.9 MBytes   100 Mbits/sec  1526
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
+[  4]   0.00-5.00   sec  58.5 MBytes  98.1 Mbits/sec  0.047 ms  357/531 (67%)
+[  4] Sent 531 datagrams
+
+Server output:
+-----------------------------------------------------------
+Accepted connection from 10.15.2.2, port 60314
+[  5] local 10.15.2.6 port 5201 connected to 10.15.2.2 port 59053
+[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
+[  5]   0.00-1.00   sec  1.36 MBytes  11.4 Mbits/sec  0.047 ms  357/531 (67%)
+[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec  0.047 ms  0/0 (-nan%)
+[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec  0.047 ms  0/0 (-nan%)
+[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec  0.047 ms  0/0 (-nan%)
+[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec  0.047 ms  0/0 (-nan%)
+
+iperf Done.
+
+The result after apply this commit
+===================================
+$ sudo ip netns exec ns02 iperf3 -t 5 -i 1 -u -b 4G -c 10.15.2.6 --get-server-output -A 5
+Connecting to host 10.15.2.6, port 5201
+[  4] local 10.15.2.2 port 48547 connected to 10.15.2.6 port 5201
+[ ID] Interval           Transfer     Bandwidth       Total Datagrams
+[  4]   0.00-1.00   sec   440 MBytes  3.69 Gbits/sec  56276
+[  4]   1.00-2.00   sec   481 MBytes  4.04 Gbits/sec  61579
+[  4]   2.00-3.00   sec   474 MBytes  3.98 Gbits/sec  60678
+[  4]   3.00-4.00   sec   480 MBytes  4.03 Gbits/sec  61452
+[  4]   4.00-5.00   sec   480 MBytes  4.03 Gbits/sec  61441
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
+[  4]   0.00-5.00   sec  2.30 GBytes  3.95 Gbits/sec  0.024 ms  0/301426 (0%)
+[  4] Sent 301426 datagrams
+
+Server output:
+-----------------------------------------------------------
+Accepted connection from 10.15.2.2, port 60320
+[  5] local 10.15.2.6 port 5201 connected to 10.15.2.2 port 48547
+[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
+[  5]   0.00-1.00   sec   209 MBytes  1.75 Gbits/sec  0.021 ms  0/26704 (0%)
+[  5]   1.00-2.00   sec   258 MBytes  2.16 Gbits/sec  0.025 ms  0/32967 (0%)
+[  5]   2.00-3.00   sec   258 MBytes  2.16 Gbits/sec  0.022 ms  0/32987 (0%)
+[  5]   3.00-4.00   sec   257 MBytes  2.16 Gbits/sec  0.023 ms  0/32954 (0%)
+[  5]   4.00-5.00   sec   257 MBytes  2.16 Gbits/sec  0.021 ms  0/32937 (0%)
+[  5]   5.00-6.00   sec   255 MBytes  2.14 Gbits/sec  0.026 ms  0/32685 (0%)
+[  5]   6.00-7.00   sec   254 MBytes  2.13 Gbits/sec  0.025 ms  0/32453 (0%)
+[  5]   7.00-8.00   sec   255 MBytes  2.14 Gbits/sec  0.026 ms  0/32679 (0%)
+[  5]   8.00-9.00   sec   255 MBytes  2.14 Gbits/sec  0.022 ms  0/32669 (0%)
+
+iperf Done.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ Documentation/automake.mk                     |   1 +
+ Documentation/howto/index.rst                 |   1 +
+ .../userspace-udp-performance-tunning.rst     | 220 ++++++++++++++++++
+ lib/automake.mk                               |   2 +
+ lib/netdev-linux.c                            |  55 +++++
+ lib/userspace-sock-buf-size.c                 |  75 ++++++
+ lib/userspace-sock-buf-size.h                 |  23 ++
+ vswitchd/bridge.c                             |   2 +
+ 8 files changed, 379 insertions(+)
+ create mode 100644 Documentation/howto/userspace-udp-performance-tunning.rst
+ create mode 100644 lib/userspace-sock-buf-size.c
+ create mode 100644 lib/userspace-sock-buf-size.h
+
+diff --git a/Documentation/automake.mk b/Documentation/automake.mk
+index f85c4320e..4431097fc 100644
+--- a/Documentation/automake.mk
++++ b/Documentation/automake.mk
+@@ -71,6 +71,7 @@ DOC_SOURCE = \
+ 	Documentation/howto/sflow.rst \
+ 	Documentation/howto/tunneling.png \
+ 	Documentation/howto/tunneling.rst \
++	Documentation/howto/userspace-udp-performance-tunning.rst \
+ 	Documentation/howto/userspace-tunneling.rst \
+ 	Documentation/howto/vlan.png \
+ 	Documentation/howto/vlan.rst \
+diff --git a/Documentation/howto/index.rst b/Documentation/howto/index.rst
+index 60fb8a717..d5271f0b0 100644
+--- a/Documentation/howto/index.rst
++++ b/Documentation/howto/index.rst
+@@ -44,6 +44,7 @@ OVS
+    lisp
+    tunneling
+    userspace-tunneling
++   userspace-udp-performance-tunning
+    vlan
+    qos
+    vtep
+diff --git a/Documentation/howto/userspace-udp-performance-tunning.rst b/Documentation/howto/userspace-udp-performance-tunning.rst
+new file mode 100644
+index 000000000..c5bd7f987
+--- /dev/null
++++ b/Documentation/howto/userspace-udp-performance-tunning.rst
+@@ -0,0 +1,220 @@
++..
++      Licensed under the Apache License, Version 2.0 (the "License"); you may
++      not use this file except in compliance with the License. You may obtain
++      a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++      Unless required by applicable law or agreed to in writing, software
++      distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++      WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++      License for the specific language governing permissions and limitations
++      under the License.
++
++      Convention for heading levels in Open vSwitch documentation:
++
++      =======  Heading 0 (reserved for the title in a document)
++      -------  Heading 1
++      ~~~~~~~  Heading 2
++      +++++++  Heading 3
++      '''''''  Heading 4
++
++      Avoid deeper levels because they do not render well.
++
++=================================
++Userspace UDP performance tunning
++=================================
++
++This document describes how to tune UDP performance for Open vSwitch
++userspace. In Open vSwitch userspace case, if you run iperf3 to test UDP
++performance, you will see bigger packet loss rate, sometimes, you also
++will see iperf3 outputs some information as below.
++
++[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   5.00-6.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   6.00-7.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec  0.018 ms  0/0 (-nan%)
++
++or
++
++iperf3: OUT OF ORDER - incoming packet = 70 and received packet = 97 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 71 and received packet = 97 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 72 and received packet = 99 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 14 and received packet = 123 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 15 and received packet = 125 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 78 and received packet = 137 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 79 and received packet = 137 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 80 and received packet = 139 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 82 and received packet = 172 AND SP = 5
++iperf3: OUT OF ORDER - incoming packet = 83 and received packet = 173 AND SP = 5
++
++There are many reasons resulting in such issues, for example, you don't use
++-b to limit bandwidth, big packet(UDP packet data size is 8192 by default if
++you don't use -l to specify UDP payload size) means many IP fragments if your
++MTU is 1500/1450, any one of them is lost, that means the whole UDP packet
++is lost because TCP/IP protocol stack can't reassemble original UDP packet, so
++big packet isn't always good for performance. But among of them, the most
++important reason is socket buffer size of UDP send side and receive side.
++
++Here is iperf3 output if system interface added to OVS use default buffer size
++(which is 212992 by default).
++
++$ sudo ip netns exec ns03 iperf3 -t 10 -i 1 -u -b 10G -c 10.15.2.3 --get-server-output
++Connecting to host 10.15.2.3, port 5201
++[  4] local 10.15.2.7 port 39415 connected to 10.15.2.3 port 5201
++[ ID] Interval           Transfer     Bandwidth       Total Datagrams
++[  4]   0.00-1.00   sec   572 MBytes  4.79 Gbits/sec  73154
++[  4]   1.00-2.00   sec   611 MBytes  5.12 Gbits/sec  78196
++[  4]   2.00-3.00   sec   588 MBytes  4.93 Gbits/sec  75248
++[  4]   3.00-4.00   sec   619 MBytes  5.19 Gbits/sec  79200
++[  4]   4.00-5.00   sec   625 MBytes  5.24 Gbits/sec  79937
++[  4]   5.00-6.00   sec   664 MBytes  5.57 Gbits/sec  85043
++[  4]   6.00-7.00   sec   636 MBytes  5.34 Gbits/sec  81417
++[  4]   7.00-8.00   sec   629 MBytes  5.27 Gbits/sec  80461
++[  4]   8.00-9.00   sec   635 MBytes  5.33 Gbits/sec  81326
++[  4]   9.00-10.00  sec   627 MBytes  5.26 Gbits/sec  80270
++- - - - - - - - - - - - - - - - - - - - - - - - -
++[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
++[  4]   0.00-10.00  sec  6.06 GBytes  5.21 Gbits/sec  0.067 ms  3793/5791 (65%)
++[  4] Sent 5791 datagrams
++
++Server output:
++- - - - - - - -
++Accepted connection from 10.15.2.7, port 54090
++[  5] local 10.15.2.3 port 5201 connected to 10.15.2.7 port 39415
++[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
++[  5]   0.00-1.00   sec  15.6 MBytes   131 Mbits/sec  0.067 ms  3793/5791 (65%)
++[  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   2.00-3.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   3.00-4.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   4.00-5.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   5.00-6.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   6.00-7.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   7.00-8.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   8.00-9.00   sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++[  5]   9.00-10.00  sec  0.00 Bytes  0.00 bits/sec  0.067 ms  0/0 (-nan%)
++
++
++iperf Done.
++
++Test setup is below:
++
++  netns ns02                           netns ns03
+++------------+                       +------------+
++|10.15.2.3/24|                       |10.15.2.7/24|
++|            |                       |            |
++|   veth02   |                       |   veth03   |
+++------|-----+  +-----------------+  +-----|------+
++       |        |                 |        |
++       +--------|       br0       |--------+
++                |(datapath=netdev)|
++                +-----------------+
++
++
++But what if you increase socket buffer size? Let us increase it to 1073741823
++and check it again.
++
++$ sudo ip netns exec ns03 iperf3 -t 10 -i 1 -u -b 3G -c 10.15.2.3 --get-server-output
++Connecting to host 10.15.2.3, port 5201
++[  4] local 10.15.2.7 port 52686 connected to 10.15.2.3 port 5201
++[ ID] Interval           Transfer     Bandwidth       Total Datagrams
++[  4]   0.00-1.00   sec   343 MBytes  2.88 Gbits/sec  43945
++[  4]   1.00-2.00   sec   357 MBytes  3.00 Gbits/sec  45742
++[  4]   2.00-3.00   sec   357 MBytes  3.00 Gbits/sec  45759
++[  4]   3.00-4.00   sec   357 MBytes  3.00 Gbits/sec  45716
++[  4]   4.00-5.00   sec   358 MBytes  3.01 Gbits/sec  45882
++[  4]   5.00-6.00   sec   360 MBytes  3.02 Gbits/sec  46046
++[  4]   6.00-7.00   sec   368 MBytes  3.09 Gbits/sec  47163
++[  4]   7.00-8.00   sec   357 MBytes  3.00 Gbits/sec  45734
++[  4]   8.00-9.00   sec   353 MBytes  2.97 Gbits/sec  45246
++[  4]   9.00-10.00  sec   356 MBytes  2.99 Gbits/sec  45630
++- - - - - - - - - - - - - - - - - - - - - - - - -
++[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
++[  4]   0.00-10.00  sec  3.49 GBytes  2.99 Gbits/sec  0.027 ms  0/456861 (0%)
++[  4] Sent 456861 datagrams
++
++Server output:
++- - - - - - - -
++Accepted connection from 10.15.2.7, port 54096
++[  5] local 10.15.2.3 port 5201 connected to 10.15.2.7 port 52686
++[ ID] Interval           Transfer     Bandwidth       Jitter    Lost/Total Datagrams
++[  5]   0.00-1.00   sec   190 MBytes  1.59 Gbits/sec  0.031 ms  0/24303 (0%)
++[  5]   1.00-2.00   sec   219 MBytes  1.84 Gbits/sec  0.023 ms  0/28025 (0%)
++[  5]   2.00-3.00   sec   219 MBytes  1.84 Gbits/sec  0.029 ms  0/28006 (0%)
++[  5]   3.00-4.00   sec   219 MBytes  1.83 Gbits/sec  0.030 ms  0/27990 (0%)
++[  5]   4.00-5.00   sec   218 MBytes  1.83 Gbits/sec  0.031 ms  0/27920 (0%)
++[  5]   5.00-6.00   sec   209 MBytes  1.76 Gbits/sec  0.094 ms  0/26807 (0%)
++[  5]   6.00-7.00   sec   185 MBytes  1.55 Gbits/sec  0.032 ms  0/23673 (0%)
++[  5]   7.00-8.00   sec   217 MBytes  1.82 Gbits/sec  0.030 ms  0/27721 (0%)
++[  5]   8.00-9.00   sec   208 MBytes  1.75 Gbits/sec  0.029 ms  0/26646 (0%)
++[  5]   9.00-10.00  sec   219 MBytes  1.84 Gbits/sec  0.029 ms  0/28007 (0%)
++[  5]  10.00-11.00  sec   217 MBytes  1.82 Gbits/sec  0.026 ms  0/27816 (0%)
++[  5]  11.00-12.00  sec   218 MBytes  1.83 Gbits/sec  0.024 ms  0/27936 (0%)
++[  5]  12.00-13.00  sec   213 MBytes  1.79 Gbits/sec  0.036 ms  0/27282 (0%)
++[  5]  13.00-14.00  sec   211 MBytes  1.77 Gbits/sec  0.035 ms  0/27018 (0%)
++[  5]  14.00-15.00  sec   212 MBytes  1.78 Gbits/sec  0.029 ms  0/27162 (0%)
++[  5]  15.00-16.00  sec   216 MBytes  1.81 Gbits/sec  0.025 ms  0/27605 (0%)
++
++
++iperf Done.
++
++You can see the performance number has huge improvement, packet loss rate
++is 0.
++
++.. note::
++
++   This howto covers the steps required to tune UDP performance. The same
++   approach can be used for iperf3 client and iperf3 server in VMs or network
++   namespaces.
++
++Tunning Steps
++-------------
++
++Perform the following steps on OVS node to tune socket buffer for OVS system
++interface.
++
++#. Change Linux system maximum socket buffer size for send and receive sides
++
++       $ sudo sh -c "1073741823 > /proc/sys/net/core/wmem_max"
++       $ sudo sh -c "1073741823 > /proc/sys/net/core/rmem_max"
++
++   In order to ensure they are still set to the above value after your system
++   is rebooted, you also need change systctl config to persist these values.
++
++       $ sudo sh -c "echo net.core.rmem_max=1073741823 >> /etc/sysctl.conf"
++       $ sudo sh -c "echo net.core.wmem_max=1073741823 >> /etc/sysctl.conf"
++
++#. Change socket buffer size for OVS system interface
++
++       $ sudo ovs-vsctl set Open_vSwitch . other_config:userspace-sock-buf-size=1073741823
++
++   Note: You can set it to smaller value per your system, final recv socket
++   buffer size for OVS system interface is minimum one of rmem_max and
++   this value, final send socket buffer size for OVS system interface is
++   minimum one of wmem_max and this value. So you can change it to the value
++   you want just by changing other_config:userspace-sock-buf-size, you also
++   can set other_config:userspace-sock-buf-size to 1073741823 and just change
++   /proc/sys/net/core/rmem_max and /proc/sys/net/core/wmem_max to set the
++   value you want, but the changed value will take effect only after you
++   restart ovs-vswitchd no matter which one you prefer to use.
++
++#. Restart ovs-vswitchd
++
++   Note: The changed value will take effect only after you restart
++   ovs-vswitchd.
++
++#. You need repeat the above steps on all the OVS nodes to make sure
++   cross-node veth-to-veth, veth-to-tap, or tap-to-tap UDP performance
++   can get improved.
++
++Potential Impact
++----------------
++
++Although this tunning can improve UDP performance, it possibly also
++impacts on TCP performance, please reset the above values to default
++values in your system if you see it hurts your TCP performance.
+diff --git a/lib/automake.mk b/lib/automake.mk
+index 380a67228..ffbc3e312 100644
+--- a/lib/automake.mk
++++ b/lib/automake.mk
+@@ -343,6 +343,8 @@ lib_libopenvswitch_la_SOURCES = \
+ 	lib/unicode.h \
+ 	lib/unixctl.c \
+ 	lib/unixctl.h \
++        lib/userspace-sock-buf-size.c \
++        lib/userspace-sock-buf-size.h \
+ 	lib/userspace-tso.c \
+ 	lib/userspace-tso.h \
+ 	lib/util.c \
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index a6507202e..f4d2eee92 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -79,6 +79,7 @@
+ #include "timer.h"
+ #include "unaligned.h"
+ #include "openvswitch/vlog.h"
++#include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
+ #include "util.h"
+ 
+@@ -1132,6 +1133,18 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+             ARRAY_SIZE(filt), (struct sock_filter *) filt
+         };
+ 
++        /* sock_buf_size must be less than 1G, so maximum value is
++         * (1 << 30) - 1, i.e. 1073741823, this doesn't mean this
++         * socket will allocate so big buffer, it just means the
++         * packets client sends won't be dropped because of small
++         * default socket buffer, the result is we can get the best
++         * possible throughtput, no packet loss, this can improve
++         * UDP and TCP performance significantly, especially for
++         * fragmented UDP.
++         */
++        uint32_t sock_buf_size = userspace_get_sock_buf_size();
++        uint32_t sock_opt_len = sizeof(sock_buf_size);
++
+         /* Create file descriptor. */
+         rx->fd = socket(PF_PACKET, SOCK_RAW, 0);
+         if (rx->fd < 0) {
+@@ -1190,6 +1203,48 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+                      netdev_get_name(netdev_), ovs_strerror(error));
+             goto error;
+         }
++
++        /* Set send socket buffer size */
++        error = setsockopt(rx->fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size, 4);
++        if (error) {
++            error = errno;
++            VLOG_ERR("%s: failed to set send socket buffer size (%s)",
++                     netdev_get_name(netdev_), ovs_strerror(error));
++            goto error;
++        }
++
++        /* Set recv socket buffer size */
++        error = setsockopt(rx->fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size, 4);
++        if (error) {
++            error = errno;
++            VLOG_ERR("%s: failed to set recv socket buffer size (%s)",
++                     netdev_get_name(netdev_), ovs_strerror(error));
++            goto error;
++        }
++
++        /* Get final recv socket buffer size, it should be
++         * 2 * ((1 << 30) - 1) (i.e. 2147483646) if successfully.
++         * Don't doubt it is wrong, Linux kernel does so, i.e.
++         * final sk_rcvbuf = val * 2.
++         */
++        error=  getsockopt(rx->fd, SOL_SOCKET, SO_RCVBUF, &sock_buf_size,
++                           &sock_opt_len);
++        if (!error) {
++            VLOG_INFO("netdev %s socket recv buffer size: %d",
++                      netdev_get_name(netdev_), sock_buf_size);
++        }
++
++        /* Get final send socket buffer size, it should be
++         * 2 * ((1 << 30) - 1) (i.e. 2147483646) if successfully.
++         * Don't doubt it is wrong, Linux kernel does so, i.e.
++         * final sk_sndbuf = val * 2.
++         */
++        error = getsockopt(rx->fd, SOL_SOCKET, SO_SNDBUF, &sock_buf_size,
++                           &sock_opt_len);
++        if (!error) {
++            VLOG_INFO("netdev %s socket send buffer size: %d",
++                      netdev_get_name(netdev_), sock_buf_size);
++        }
+     }
+     ovs_mutex_unlock(&netdev->mutex);
+ 
+diff --git a/lib/userspace-sock-buf-size.c b/lib/userspace-sock-buf-size.c
+new file mode 100644
+index 000000000..e4c9381b8
+--- /dev/null
++++ b/lib/userspace-sock-buf-size.c
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (c) 2020 Inspur, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <config.h>
++
++#include "smap.h"
++#include "ovs-thread.h"
++#include "openvswitch/vlog.h"
++#include "userspace-sock-buf-size.h"
++
++VLOG_DEFINE_THIS_MODULE(userspace_sock_buf_size);
++
++/* Default socket buffer size for system interface is
++ * 1073741823, i.e. 1024 * 1024 * 1024 - 1, it can help
++ * improve UDP performance, you can tune it per your
++ * system by the below command
++ *   ovs-vsctl set Open_vSwitch . \
++ *     other_config:userspace_sock_buf_size = XXXX
++ *
++ * 1073741823 is maximum possible value, the value you
++ * set must be less than or equal to 1073741823.
++ */
++
++/* Minimum socket buffer size, it is Linux default size */
++#define MIN_SOCK_BUF_SIZE 212992
++
++/* Maximum possible socket buffer size */
++#define MAX_SOCK_BUF_SIZE 1073741823
++
++#define DEFAULT_SOCK_BUF_SIZE MIN_SOCK_BUF_SIZE
++
++static uint32_t userspace_sock_buf_size = DEFAULT_SOCK_BUF_SIZE;
++
++void
++userspace_sock_buf_size_init(const struct smap *ovs_other_config)
++{
++    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
++
++    if (ovsthread_once_start(&once)) {
++        uint32_t sock_buf_size;
++
++        sock_buf_size = smap_get_int(ovs_other_config,
++                                     "userspace-sock-buf-size",
++                                     DEFAULT_SOCK_BUF_SIZE);
++        if (sock_buf_size < MIN_SOCK_BUF_SIZE) {
++            sock_buf_size = MIN_SOCK_BUF_SIZE;
++        } else if (sock_buf_size > MAX_SOCK_BUF_SIZE) {
++            sock_buf_size = MAX_SOCK_BUF_SIZE;
++        }
++
++        userspace_sock_buf_size = sock_buf_size;
++        VLOG_INFO("Userspace socket buffer size for system interface: %d",
++                  userspace_sock_buf_size);
++        ovsthread_once_done(&once);
++    }
++}
++
++uint32_t
++userspace_get_sock_buf_size(void)
++{
++    return userspace_sock_buf_size;
++}
+diff --git a/lib/userspace-sock-buf-size.h b/lib/userspace-sock-buf-size.h
+new file mode 100644
+index 000000000..80385ba24
+--- /dev/null
++++ b/lib/userspace-sock-buf-size.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (c) 2020 Inspur Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef USERSPACE_SOCK_SIZE_H
++#define USERSPACE_SOCK_SIZE_H 1
++
++void userspace_sock_buf_size_init(const struct smap *ovs_other_config);
++uint32_t userspace_get_sock_buf_size(void);
++
++#endif /* userspace-sock-buf-size.h */
+diff --git a/vswitchd/bridge.c b/vswitchd/bridge.c
+index 3151b57b4..0a764cd4a 100644
+--- a/vswitchd/bridge.c
++++ b/vswitchd/bridge.c
+@@ -65,6 +65,7 @@
+ #include "system-stats.h"
+ #include "timeval.h"
+ #include "tnl-ports.h"
++#include "userspace-sock-buf-size.h"
+ #include "userspace-tso.h"
+ #include "util.h"
+ #include "unixctl.h"
+@@ -3296,6 +3297,7 @@ bridge_run(void)
+         netdev_set_flow_api_enabled(&cfg->other_config);
+         dpdk_init(&cfg->other_config);
+         userspace_tso_init(&cfg->other_config);
++        userspace_sock_buf_size_init(&cfg->other_config);
+     }
+ 
+     /* Initialize the ofproto library.  This only needs to run once, but
+-- 
+2.17.1
+

@@ -1,0 +1,302 @@
+From 31c9fc12cca5f9417312d40e97956891b25d5ed9 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 30 Dec 2020 21:58:53 -0500
+Subject: [PATCH 15/19] gso: support IPv4 VxLAN UDP/IPv6
+
+This patch adds IPv4 VxLAN UDP/IPv6 GSO support.
+
+Supported VxLAN packets must have an outer IPv4 header
+(prepended by an optional VLAN tag), and contain an inner
+UDP/IPv6 packet (with an optional inner VLAN tag).
+
+It does not check if input packets have correct checksums
+and does not update checksums for output packets.
+Additionally, it does not process IP fragments.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ .../generic_segmentation_offload_lib.rst      |  11 +-
+ lib/librte_gso/Makefile                       |   1 +
+ lib/librte_gso/gso_common.h                   |   5 +
+ lib/librte_gso/gso_tunnel_udp6.c              | 116 ++++++++++++++++++
+ lib/librte_gso/gso_tunnel_udp6.h              |  45 +++++++
+ lib/librte_gso/meson.build                    |   2 +-
+ lib/librte_gso/rte_gso.c                      |   7 ++
+ 7 files changed, 184 insertions(+), 3 deletions(-)
+ create mode 100644 lib/librte_gso/gso_tunnel_udp6.c
+ create mode 100644 lib/librte_gso/gso_tunnel_udp6.h
+
+diff --git a/doc/guides/prog_guide/generic_segmentation_offload_lib.rst b/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
+index c928f0de60..57e5a24b1a 100644
+--- a/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
++++ b/doc/guides/prog_guide/generic_segmentation_offload_lib.rst
+@@ -47,6 +47,7 @@ Limitations
+  - UDP/IPv4
+  - UDP/IPv6
+  - IPv4 VxLAN TCP/UDP IPv4
++ - IPv4 VxLAN UDP IPv6
+  - GRE TCP
+ 
+   See `Supported GSO Packet Types`_ for further details.
+@@ -167,12 +168,18 @@ does not modify it during segmentation. Therefore, after UDP GSO, only the
+ first output packet has the original UDP header, and others just have l2
+ and l3 headers.
+ 
+-VXLAN IPv4 GSO
+-~~~~~~~~~~~~~~
++IPv4 VXLAN IPv4 GSO
++~~~~~~~~~~~~~~~~~~~
+ VXLAN packets GSO supports segmentation of suitably large VXLAN packets,
+ which contain an outer IPv4 header, inner TCP/IPv4 or UDP/IPv4 headers, and
+ optional inner and/or outer VLAN tag(s).
+ 
++IPv4 VxLAN UDP/IPv6 GSO
++~~~~~~~~~~~~~~~~~~~~~~~
++IPv4 VxLAN UDP/IPv6 GSO supports segmentation of suitably large IPv4 VxLAN
++packets, which contain an outer IPv4 header, inner UDP/IPv6 headers, and
++optional inner and/or outer VLAN tag(s).
++
+ GRE TCP/IPv4 GSO
+ ~~~~~~~~~~~~~~~~
+ GRE GSO supports segmentation of suitably large GRE packets, which contain
+diff --git a/lib/librte_gso/Makefile b/lib/librte_gso/Makefile
+index 50ccee36bc..f273e80a44 100644
+--- a/lib/librte_gso/Makefile
++++ b/lib/librte_gso/Makefile
+@@ -20,6 +20,7 @@ SRCS-$(CONFIG_RTE_LIBRTE_GSO) += gso_tunnel_tcp4.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GSO) += gso_udp4.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GSO) += gso_tunnel_udp4.c
+ SRCS-$(CONFIG_RTE_LIBRTE_GSO) += gso_udp6.c
++SRCS-$(CONFIG_RTE_LIBRTE_GSO) += gso_tunnel_udp6.c
+ 
+ # install this header file
+ SYMLINK-$(CONFIG_RTE_LIBRTE_GSO)-include += rte_gso.h
+diff --git a/lib/librte_gso/gso_common.h b/lib/librte_gso/gso_common.h
+index 0b617dd363..21defdf917 100644
+--- a/lib/librte_gso/gso_common.h
++++ b/lib/librte_gso/gso_common.h
+@@ -42,6 +42,11 @@
+ #define IS_IPV6_UDP(flag) (((flag) & (PKT_TX_UDP_SEG | PKT_TX_IPV6)) == \
+ 		(PKT_TX_UDP_SEG | PKT_TX_IPV6))
+ 
++#define IS_IPV4_VXLAN_UDP6(flag) (((flag) & (PKT_TX_UDP_SEG | PKT_TX_IPV6 | \
++				PKT_TX_OUTER_IPV4 | PKT_TX_TUNNEL_MASK)) == \
++		(PKT_TX_UDP_SEG | PKT_TX_IPV6 | PKT_TX_OUTER_IPV4 | \
++		 PKT_TX_TUNNEL_VXLAN))
++
+ /**
+  * Internal function which updates the UDP header of a packet, following
+  * segmentation. This is required to update the header's datagram length field.
+diff --git a/lib/librte_gso/gso_tunnel_udp6.c b/lib/librte_gso/gso_tunnel_udp6.c
+new file mode 100644
+index 0000000000..ef1225cda7
+--- /dev/null
++++ b/lib/librte_gso/gso_tunnel_udp6.c
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2021 Inspur Corporation
++ */
++
++#include <rte_ip.h>
++#include "gso_common.h"
++#include "gso_tunnel_udp6.h"
++
++static inline void
++update_ipv4_tunnel_ipv6_udp_headers(struct rte_mbuf *pkt,
++				    struct rte_mbuf **segs,
++				    uint16_t nb_segs)
++{
++	struct rte_ipv4_hdr *outer_ipv4_hdr;
++	uint16_t outer_id;
++	uint16_t outer_ipv4_offset, inner_ipv6_offset;
++	uint16_t outer_udp_offset;
++	struct rte_ipv6_hdr *inner_ipv6_hdr;
++	uint16_t frag_offset = 0, is_mf;
++	uint16_t tail_idx = nb_segs - 1, length, i;
++	struct rte_ipv6_fragment_ext ipv6_frag_hdr;
++	uint16_t fh_len = sizeof(ipv6_frag_hdr);
++	uint16_t payload_offset = pkt->outer_l2_len + pkt->outer_l3_len
++					+ pkt->l2_len + pkt->l3_len;
++
++	outer_ipv4_offset = pkt->outer_l2_len;
++	outer_udp_offset = outer_ipv4_offset + pkt->outer_l3_len;
++
++	/* Outer IPv4 header. */
++	outer_ipv4_hdr = (struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(pkt, char *) +
++			outer_ipv4_offset);
++	outer_id = rte_be_to_cpu_16(outer_ipv4_hdr->packet_id);
++
++	inner_ipv6_offset = outer_udp_offset + pkt->l2_len;
++
++	/*
++	 * Update IP header fields for output segments. Specifically,
++	 * update fragment offset and payload length.
++	 *
++	 * For IPv6, every segment need to insert a fragment extension
++	 * header.
++	 */
++	inner_ipv6_hdr = rte_pktmbuf_mtod_offset(pkt,
++		struct rte_ipv6_hdr *, inner_ipv6_offset);
++	ipv6_frag_hdr.next_header = inner_ipv6_hdr->proto;
++	ipv6_frag_hdr.id = get_ipv6_frag_id(inner_ipv6_hdr->src_addr,
++						inner_ipv6_hdr->dst_addr);
++	for (i = 0; i < nb_segs; i++) {
++		inner_ipv6_hdr = rte_pktmbuf_mtod_offset(segs[i],
++			struct rte_ipv6_hdr *, inner_ipv6_offset);
++		length = segs[i]->pkt_len - payload_offset;
++
++		is_mf = i < tail_idx ? 1 : 0;
++		ipv6_frag_hdr.frag_data =
++			rte_cpu_to_be_16((frag_offset << 3) | is_mf);
++		frag_offset += (length >> 3);
++		if (rte_pktmbuf_prepend(segs[i], fh_len)) {
++			inner_ipv6_hdr->proto = IPPROTO_FRAGMENT;
++			inner_ipv6_hdr->payload_len
++				= rte_cpu_to_be_16(length + fh_len);
++			memmove(rte_pktmbuf_mtod(segs[i], char*),
++				rte_pktmbuf_mtod_offset(segs[i], char *,
++							fh_len),
++				payload_offset);
++			memcpy(rte_pktmbuf_mtod_offset(segs[i], char *,
++							payload_offset),
++				&ipv6_frag_hdr, fh_len);
++		}
++		update_udp_header(segs[i], outer_udp_offset);
++		update_ipv4_header(segs[i], outer_ipv4_offset, outer_id);
++		outer_id++;
++	}
++}
++
++int
++gso_tunnel_udp6_segment(struct rte_mbuf *pkt,
++		uint16_t gso_size,
++		struct rte_mempool *direct_pool,
++		struct rte_mempool *indirect_pool,
++		struct rte_mbuf **pkts_out,
++		uint16_t nb_pkts_out)
++{
++	struct rte_ipv6_hdr *inner_ipv6_hdr;
++	uint16_t pyld_unit_size, hdr_offset;
++	uint16_t fh_len = sizeof(struct rte_ipv6_fragment_ext);
++	int ret;
++
++	hdr_offset = pkt->outer_l2_len + pkt->outer_l3_len + pkt->l2_len;
++	inner_ipv6_hdr = (struct rte_ipv6_hdr *)(rte_pktmbuf_mtod(pkt, char *) +
++			hdr_offset);
++
++	/* Don't process the fragmented packet */
++	if (unlikely(inner_ipv6_hdr->proto == IPPROTO_FRAGMENT))
++		return 0;
++
++	hdr_offset += pkt->l3_len;
++	/* Don't process the packet without data */
++	if ((hdr_offset + pkt->l4_len) >= pkt->pkt_len)
++		return 0;
++
++	/* pyld_unit_size must be a multiple of 8 because frag_off
++	 * uses 8 bytes as unit.
++	 *
++	 * For IPv6, every segment need to insert a fragment extension
++	 * header, so subtract it from pyld_unit_size.
++	 */
++	pyld_unit_size = (gso_size - hdr_offset - fh_len) & ~7U;
++
++	/* Segment the payload */
++	ret = gso_do_segment(pkt, hdr_offset, pyld_unit_size, direct_pool,
++			indirect_pool, pkts_out, nb_pkts_out);
++	if (ret > 1)
++		update_ipv4_tunnel_ipv6_udp_headers(pkt, pkts_out, ret);
++
++	return ret;
++}
+diff --git a/lib/librte_gso/gso_tunnel_udp6.h b/lib/librte_gso/gso_tunnel_udp6.h
+new file mode 100644
+index 0000000000..db20b2e448
+--- /dev/null
++++ b/lib/librte_gso/gso_tunnel_udp6.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2021 Inspur Corporation
++ */
++
++#ifndef _GSO_TUNNEL_UDP6_H_
++#define _GSO_TUNNEL_UDP6_H_
++
++#include <stdint.h>
++#include <rte_mbuf.h>
++#include "gso_udp6.h"
++
++/**
++ * Segment a tunneling packet with inner UDP/IPv6 headers. This function
++ * does not check if the input packet has correct checksums, and does not
++ * update checksums for output GSO segments. Furthermore, it does not
++ * process IP fragment packets.
++ *
++ * @param pkt
++ *  The packet mbuf to segment.
++ * @param gso_size
++ *  The max length of a GSO segment, measured in bytes.
++ * @param direct_pool
++ *  MBUF pool used for allocating direct buffers for output segments.
++ * @param indirect_pool
++ *  MBUF pool used for allocating indirect buffers for output segments.
++ * @param pkts_out
++ *  Pointer array used to store the MBUF addresses of output GSO
++ *  segments, when it succeeds. If the memory space in pkts_out is
++ *  insufficient, it fails and returns -EINVAL.
++ * @param nb_pkts_out
++ *  The max number of items that 'pkts_out' can keep.
++ *
++ * @return
++ *   - The number of GSO segments filled in pkts_out on success.
++ *   - Return 0 if it needn't GSO.
++ *   - Return -ENOMEM if run out of memory in MBUF pools.
++ *   - Return -EINVAL for invalid parameters.
++ */
++int gso_tunnel_udp6_segment(struct rte_mbuf *pkt,
++		uint16_t gso_size,
++		struct rte_mempool *direct_pool,
++		struct rte_mempool *indirect_pool,
++		struct rte_mbuf **pkts_out,
++		uint16_t nb_pkts_out);
++#endif
+diff --git a/lib/librte_gso/meson.build b/lib/librte_gso/meson.build
+index c3d813d1ec..4c3f719f11 100644
+--- a/lib/librte_gso/meson.build
++++ b/lib/librte_gso/meson.build
+@@ -3,6 +3,6 @@
+ 
+ sources = files('gso_common.c', 'gso_tcp4.c', 'gso_udp4.c',
+ 		'gso_tunnel_tcp4.c', 'gso_tunnel_udp4.c', 'gso_udp6.c',
+-		'rte_gso.c')
++		'gso_tunnel_udp6.c', 'rte_gso.c')
+ headers = files('rte_gso.h')
+ deps += ['ethdev']
+diff --git a/lib/librte_gso/rte_gso.c b/lib/librte_gso/rte_gso.c
+index a837d6e600..7c51b73595 100644
+--- a/lib/librte_gso/rte_gso.c
++++ b/lib/librte_gso/rte_gso.c
+@@ -12,6 +12,7 @@
+ #include "gso_tcp4.h"
+ #include "gso_tunnel_tcp4.h"
+ #include "gso_tunnel_udp4.h"
++#include "gso_tunnel_udp6.h"
+ #include "gso_udp4.h"
+ #include "gso_udp6.h"
+ 
+@@ -69,6 +70,12 @@ rte_gso_segment(struct rte_mbuf *pkt,
+ 		ret = gso_tunnel_udp4_segment(pkt, gso_size,
+ 				direct_pool, indirect_pool,
+ 				pkts_out, nb_pkts_out);
++	} else if (IS_IPV4_VXLAN_UDP6(pkt->ol_flags) &&
++			(gso_ctx->gso_types & (DEV_TX_OFFLOAD_VXLAN_TNL_TSO |
++					       DEV_TX_OFFLOAD_UDP_TSO))) {
++		pkt->ol_flags &= (~PKT_TX_UDP_SEG);
++		ret = gso_tunnel_udp6_segment(pkt, gso_size, direct_pool,
++				indirect_pool, pkts_out, nb_pkts_out);
+ 	} else if (IS_IPV4_TCP(pkt->ol_flags) &&
+ 			(gso_ctx->gso_types & DEV_TX_OFFLOAD_TCP_TSO)) {
+ 		pkt->ol_flags &= (~PKT_TX_TCP_SEG);
+-- 
+2.17.1
+

@@ -1,0 +1,112 @@
+From ba96bd5e84f19c8de580937428effe807c75a720 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 26 Oct 2020 23:16:22 -0400
+Subject: [PATCH 23/47] Fix VXLAN TSO issue for inner IPv6 case
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 31 +++++++++++++++++++------------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 8c4c938f2..82339241d 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2234,15 +2234,16 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                         + sizeof(struct vxlanhdr);
+         if (mbuf->l3_len == IP_HEADER_LEN) {
+             mbuf->ol_flags |= PKT_TX_IPV4;
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+             ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+             l4_proto = ip_hdr->next_proto_id;
+         } else if (mbuf->l3_len == IPV6_HEADER_LEN) {
++            /* Note: no IP checksum for IPv6 */
+             mbuf->ol_flags |= PKT_TX_IPV6;
+             ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
+             l4_proto = ip6_hdr->proto;
+         }
+ 
+-        mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         if (l4_proto == IPPROTO_TCP) {
+             mbuf->ol_flags |= PKT_TX_TCP_SEG;
+             mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
+@@ -2311,9 +2312,6 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                 ((uint8_t *)udp_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
+             l3_hdr_ptr = (uint8_t *)ip6_hdr;
+-
+-            /* inner IP checksum offload offload */
+-            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+ 
+         /* In case of MTU > tso_segsz, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't
+@@ -2347,9 +2345,6 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             ip6_hdr = (struct rte_ipv6_hdr *)((char *)eth_hdr + mbuf->l2_len);
+             l4_proto = ip6_hdr->proto;
+             l3_hdr_ptr = (uint8_t *)ip6_hdr;
+-
+-            /* IP checksum offload */
+-            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+ 
+         /* In case of GRO, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't set by GRO
+@@ -2402,6 +2397,12 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
+             mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
+                                   + mbuf->outer_l3_len + mbuf->l2_len;
++            /* i40e has bug for IPv6, when tso_segsz is 1514, actual seg size
++             * is 1650, so minus 136 to avoid too big.
++             */
++            if (mbuf->ol_flags & PKT_TX_IPV6) {
++                mbuf->tso_segsz -= 136;
++            }
+         } else {
+             mbuf->tso_segsz = 0;
+         }
+@@ -2972,8 +2973,8 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+ 
+     if (offset == 0) {
+         *is_frag = 0;
++        mbuf->packet_type = 0;
+     }
+-    mbuf->packet_type = 0;
+     l2_len = ETH_HEADER_LEN;
+     eth_type = (OVS_FORCE ovs_be16) eth_hdr->ether_type;
+     if (eth_type_vlan(eth_type)) {
+@@ -2996,13 +2997,22 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+         dp_packet_hwol_set_tx_ipv4(pkt);
+         *l4_proto = ipv4_hdr->next_proto_id;
+         *is_frag = rte_ipv4_frag_pkt_is_fragmented(ipv4_hdr);
+-        mbuf->packet_type |= RTE_PTYPE_L3_IPV4;
++        if (offset == 0) {
++            mbuf->packet_type |= RTE_PTYPE_L3_IPV4;
++        } else {
++            mbuf->packet_type |= RTE_PTYPE_INNER_L3_IPV4;
++        }
+     } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
+         struct rte_ipv6_hdr *ipv6_hdr = (struct rte_ipv6_hdr *)
+             ((char *)eth_hdr + l2_len);
+         l3_len = IPV6_HEADER_LEN;
+         dp_packet_hwol_set_tx_ipv6(pkt);
+         *l4_proto = ipv6_hdr->proto;
++        if (offset == 0) {
++            mbuf->packet_type |= RTE_PTYPE_L3_IPV6;
++        } else {
++            mbuf->packet_type |= RTE_PTYPE_INNER_L3_IPV6;
++        }
+     }
+ 
+     dp_packet_hwol_set_l3_len(pkt, l3_len);
+@@ -3036,9 +3046,6 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+ 
+             /* Set packet_type, it is necessary for GRO */
+             mbuf->packet_type |= RTE_PTYPE_TUNNEL_VXLAN;
+-            if (mbuf->l3_len == IP_HEADER_LEN) {
+-                mbuf->packet_type |= RTE_PTYPE_INNER_L3_IPV4;
+-            }
+             if (inner_l4_proto == IPPROTO_TCP) {
+                 mbuf->packet_type |= RTE_PTYPE_INNER_L4_TCP;
+                 mbuf->packet_type |= RTE_PTYPE_L4_UDP;
+-- 
+2.17.1
+

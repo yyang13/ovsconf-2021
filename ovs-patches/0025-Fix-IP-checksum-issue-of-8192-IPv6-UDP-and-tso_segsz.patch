@@ -1,0 +1,77 @@
+From 95704ab7f746a451cc8bdd683bdf5d9e5b26dce6 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 4 Nov 2020 03:27:59 -0500
+Subject: [PATCH 25/47] Fix IP checksum issue of 8192 IPv6 UDP and tso_segsz
+ issue
+
+Note: outer IP cheksum of VxLAN packet is incorrect for inner
+IPv6, so enable PKT_TX_IP_CKSUM to offload it.
+
+In addition, for TSO and VxLAN TSO, mbuf->tso_segsz means
+segment size of application data part, not including l3_len
+and l4_len, so mbuf->tso_segsz should be VM MTU minus l3_len
+and l4_len.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 21 +++++++++------------
+ 1 file changed, 9 insertions(+), 12 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index b9f167b8d..83395f19b 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2217,7 +2217,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      */
+     if (is_local_to_local(mbuf->port, dev)) {
+         if (mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)) {
+-            mbuf->tso_segsz = tso_segsz + mbuf->l2_len;
++            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
+         }
+         return true;
+     }
+@@ -2259,11 +2259,10 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             }
+         }
+         if (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN)) {
+-            mbuf->tso_segsz = tso_segsz;
++            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
+             if (mbuf->tso_segsz > dev->mtu) {
+-                mbuf->tso_segsz = dev->mtu;
++                mbuf->tso_segsz = dev->mtu - mbuf->l3_len - mbuf->l4_len;
+             }
+-            mbuf->tso_segsz += mbuf->l2_len;
+         }
+ 
+         return true;
+@@ -2404,14 +2403,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ 
+         mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
+         if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
+-            mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
+-                                  + mbuf->outer_l3_len + mbuf->l2_len;
+-            /* i40e has bug for IPv6, when tso_segsz is 1514, actual seg size
+-             * is 1650, so minus 136 to avoid too big.
+-             */
+-            if (mbuf->ol_flags & PKT_TX_IPV6) {
+-                mbuf->tso_segsz -= 136;
+-            }
++            mbuf->tso_segsz = tso_segsz - mbuf->l3_len - mbuf->l4_len;
+         } else {
+             mbuf->tso_segsz = 0;
+         }
+@@ -2435,6 +2427,11 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                 mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+                 mbuf->ol_flags &= ~PKT_TX_OUTER_IP_CKSUM;
+                 mbuf->ol_flags &= ~PKT_TX_OUTER_IPV4;
++                if (mbuf->ol_flags & PKT_TX_IPV6) {
++                    mbuf->ol_flags &= ~PKT_TX_IPV6;
++                    mbuf->ol_flags |= PKT_TX_IPV4;
++                    mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++                }
+                 mbuf->l2_len = mbuf->outer_l2_len;
+                 mbuf->l3_len = mbuf->outer_l3_len;
+                 mbuf->outer_l2_len = 0;
+-- 
+2.17.1
+

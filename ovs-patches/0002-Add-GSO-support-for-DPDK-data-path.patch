@@ -1,0 +1,705 @@
+From 753b3eba34d7d5b8181125f9e9023f54a94a9796 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 5 Aug 2020 05:45:16 -0400
+Subject: [PATCH 02/47] Add GSO support for DPDK data path
+
+GSO(Generic Segment Offload) can segment large UDP
+ and TCP packet to small packets per MTU of destination
+, especially for the case that physical NIC can't
+do hardware offload VXLAN TSO and VXLAN UFO, GSO can
+make sure userspace TSO can still work but not drop.
+
+In addition, GSO can help improve UDP performane when
+UFO is enabled in VM.
+
+GSO can support TCP, UDP, VXLAN TCP, VXLAN UDP, it is
+done in Tx function of physical NIC.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.h    |  21 ++-
+ lib/netdev-dpdk.c  | 358 ++++++++++++++++++++++++++++++++++++++++++---
+ lib/netdev-linux.c |  17 ++-
+ lib/netdev.c       |  67 ++++++---
+ 4 files changed, 417 insertions(+), 46 deletions(-)
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 79895f299..c33868d52 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -83,6 +83,8 @@ enum dp_packet_offload_mask {
+     DEF_OL_FLAG(DP_PACKET_OL_TX_SCTP_CKSUM, PKT_TX_SCTP_CKSUM, 0x800),
+     /* VXLAN TCP Segmentation Offload. */
+     DEF_OL_FLAG(DP_PACKET_OL_TX_TUNNEL_VXLAN, PKT_TX_TUNNEL_VXLAN, 0x1000),
++    /* UDP Segmentation Offload. */
++    DEF_OL_FLAG(DP_PACKET_OL_TX_UDP_SEG, PKT_TX_UDP_SEG, 0x2000),
+     /* Adding new field requires adding to DP_PACKET_OL_SUPPORTED_MASK. */
+ };
+ 
+@@ -97,7 +99,8 @@ enum dp_packet_offload_mask {
+                                      DP_PACKET_OL_TX_IPV6          | \
+                                      DP_PACKET_OL_TX_TCP_CKSUM     | \
+                                      DP_PACKET_OL_TX_UDP_CKSUM     | \
+-                                     DP_PACKET_OL_TX_SCTP_CKSUM)
++                                     DP_PACKET_OL_TX_SCTP_CKSUM    | \
++                                     DP_PACKET_OL_TX_UDP_SEG)
+ 
+ #define DP_PACKET_OL_TX_L4_MASK (DP_PACKET_OL_TX_TCP_CKSUM | \
+                                  DP_PACKET_OL_TX_UDP_CKSUM | \
+@@ -956,6 +959,13 @@ dp_packet_hwol_is_tso(const struct dp_packet *b)
+     return !!(*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_TCP_SEG);
+ }
+ 
++/* Returns 'true' if packet 'b' is marked for UDP segmentation offloading. */
++static inline bool
++dp_packet_hwol_is_uso(const struct dp_packet *b)
++{
++    return !!(*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_UDP_SEG);
++}
++
+ /* Returns 'true' if packet 'b' is marked for IPv4 checksum offloading. */
+ static inline bool
+ dp_packet_hwol_is_ipv4(const struct dp_packet *b)
+@@ -1034,6 +1044,15 @@ dp_packet_hwol_set_tcp_seg(struct dp_packet *b)
+     *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_TCP_SEG;
+ }
+ 
++/* Mark packet 'b' for UDP segmentation offloading.  It implies that
++ * either the packet 'b' is marked for IPv4 or IPv6 checksum offloading
++ * and also for UDP checksum offloading. */
++static inline void
++dp_packet_hwol_set_udp_seg(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_UDP_SEG;
++}
++
+ #ifdef DPDK_NETDEV
+ /* Mark packet 'b' for VXLAN TCP segmentation offloading. */
+ static inline void
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 982e7c48b..0681279c2 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -38,13 +38,15 @@
+ #include <rte_errno.h>
+ #include <rte_ethdev.h>
+ #include <rte_flow.h>
++#include <rte_gso.h>
++#include <rte_ip.h>
+ #include <rte_malloc.h>
+ #include <rte_mbuf.h>
+ #include <rte_meter.h>
+ #include <rte_pci.h>
+ #include <rte_version.h>
+ #include <rte_vhost.h>
+-#include <rte_ip.h>
++#include <rte_ip_frag.h>
+ 
+ #include "cmap.h"
+ #include "coverage.h"
+@@ -162,6 +164,7 @@ typedef uint16_t dpdk_port_t;
+                                    | DEV_TX_OFFLOAD_UDP_CKSUM    \
+                                    | DEV_TX_OFFLOAD_IPV4_CKSUM)
+ 
++#define MAX_GSO_MBUFS 64
+ 
+ static const struct rte_eth_conf port_conf = {
+     .rxmode = {
+@@ -2178,6 +2181,16 @@ is_local_to_local(uint16_t src_port_id, struct netdev_dpdk *dev)
+     return ret;
+ }
+ 
++static uint16_t
++get_udptcp_checksum(void *l3_hdr, void *l4_hdr, uint16_t ethertype)
++{
++        if (ethertype == htons(RTE_ETHER_TYPE_IPV4)) {
++                return rte_ipv4_udptcp_cksum(l3_hdr, l4_hdr);
++        } else { /* assume ethertype == RTE_ETHER_TYPE_IPV6 */
++                return rte_ipv6_udptcp_cksum(l3_hdr, l4_hdr);
++        }
++}
++
+ /* Prepare the packet for HWOL.
+  * Return True if the packet is OK to continue. */
+ static bool
+@@ -2210,10 +2223,9 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+          * also can't be handled. So PKT_TX_TUNNEL_VXLAN must be cleared
+          * outer_l2_len and outer_l3_len must be zeroed.
+          */
+-        if (!(dev->up.ol_flags & NETDEV_TX_OFFLOAD_VXLAN_TSO)
+-            || (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG))
++        if (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG))
+             && (mbuf->pkt_len <= 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
+-                + mbuf->l2_len)))  {
++                + mbuf->l2_len))  {
+             mbuf->ol_flags &= ~PKT_TX_TUNNEL_VXLAN;
+             mbuf->l2_len -= sizeof(struct udp_header)
+                         + sizeof(struct vxlanhdr);
+@@ -2256,7 +2268,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             /* inner IP checksum offload offload */
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+-    } else if (mbuf->ol_flags & PKT_TX_L4_MASK) {
++    } else if (mbuf->ol_flags & (PKT_TX_IPV4 | PKT_TX_IPV6)) {
+         /* Handle VLAN TSO */
+             /* no inner IP checksum for IPV6 */
+         if (mbuf->ol_flags & PKT_TX_IPV4) {
+@@ -2280,6 +2292,18 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         mbuf->l3_len = (char *)dp_packet_l4(pkt) - (char *)dp_packet_l3(pkt);
+         mbuf->outer_l2_len = 0;
+         mbuf->outer_l3_len = 0;
++
++        /* In case of GRO, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't set by GRO
++         * APIs, here is a place we can mark it.
++         */
++        if ((mbuf->pkt_len > 1464)
++            && (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)))) {
++            if (l4_proto == IPPROTO_UDP) {
++                mbuf->ol_flags |= PKT_TX_UDP_SEG;
++            } else if (l4_proto == IPPROTO_TCP) {
++                mbuf->ol_flags |= PKT_TX_TCP_SEG;
++            }
++        }
+     }
+ 
+     /* It is possible that l4_len isn't set for vhostuserclient */
+@@ -2291,6 +2315,10 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         mbuf->l4_len = (tcp_hdr->data_off & 0xf0) >> 2;
+     }
+ 
++    if ((l4_proto != IPPROTO_UDP) && (l4_proto != IPPROTO_TCP)) {
++        return true;
++    }
++
+     if ((mbuf->ol_flags & PKT_TX_L4_MASK) == PKT_TX_UDP_CKSUM) {
+         if (l4_proto != IPPROTO_UDP) {
+             VLOG_WARN_RL(&rl, "%s: UDP packet without L4 header"
+@@ -2301,11 +2329,13 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+                mbuf->ol_flags & PKT_TX_TCP_CKSUM) {
+         if (l4_proto != IPPROTO_TCP) {
+             VLOG_WARN_RL(&rl, "%s: TCP Segmentation without L4 header"
+-                         " pkt len: %"PRIu32"", dev->up.name, mbuf->pkt_len);
++                         " pkt len: %"PRIu32" l4_proto = %d",
++                         dev->up.name, mbuf->pkt_len, l4_proto);
+             return false;
+         }
+ 
+-        if (mbuf->pkt_len - mbuf->l2_len > 1450) {
++        if (mbuf->pkt_len > 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len
++            + mbuf->l2_len) {
+             dp_packet_hwol_set_tcp_seg(pkt);
+         }
+ 
+@@ -2315,7 +2345,66 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         } else {
+             mbuf->tso_segsz = 0;
+         }
++
++        if (!(dev->up.ol_flags & NETDEV_TX_OFFLOAD_TCP_TSO)) {
++            /* PKT_TX_TCP_CKSUM must be cleaned for GSO because
++             * tcp checksum only can be caculated by software for
++             * GSO case.
++             */
++            mbuf->ol_flags &= ~PKT_TX_TCP_CKSUM;
++        }
+     }
++
++    /* UDP GSO if necessary */
++    if (l4_proto == IPPROTO_UDP) {
++        /* VXLAN GSO can be done here */
++        if ((mbuf->ol_flags & PKT_TX_UDP_SEG) ||
++            (mbuf->pkt_len > (1450 + mbuf->outer_l2_len + mbuf->outer_l3_len +
++                             mbuf->l2_len))) {
++            dp_packet_hwol_set_udp_seg(pkt);
++
++            /* For UDP GSO, udp checksum must be calculated by software */
++            if ((mbuf->ol_flags & PKT_TX_L4_MASK) == PKT_TX_UDP_CKSUM) {
++                void *l3_hdr, *l4_hdr;
++                struct rte_udp_hdr *udp_hdr;
++
++                /* PKT_TX_UDP_CKSUM must be cleaned for GSO because
++                 * udp checksum only can be caculated by software for
++                 * GSO case.
++                 */
++                mbuf->ol_flags &= ~PKT_TX_UDP_CKSUM;
++
++                eth_hdr = (struct rte_ether_hdr *)
++                    ((uint8_t *)eth_hdr + mbuf->outer_l2_len +
++                               mbuf->outer_l3_len +
++                               sizeof(struct udp_header) +
++                               sizeof(struct vxlanhdr));
++                l3_hdr = (uint8_t *)eth_hdr + mbuf->l2_len -
++                         sizeof(struct udp_header) -
++                         sizeof(struct vxlanhdr);
++                l4_hdr = (uint8_t *)l3_hdr + mbuf->l3_len;
++                ip_hdr = (struct rte_ipv4_hdr *)l3_hdr;
++                ip_hdr->hdr_checksum = 0;
++                ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
++                /* Don't touch UDP checksum if it is ip fragment */
++                if (!rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
++                    udp_hdr = (struct rte_udp_hdr *)l4_hdr;
++                    udp_hdr->dgram_cksum = 0;
++                    udp_hdr->dgram_cksum =
++                        get_udptcp_checksum(l3_hdr, l4_hdr,
++                                            eth_hdr->ether_type);
++                }
++            }
++
++            /* FOR GSO, gso_size includes l2_len + l3_len */
++            mbuf->tso_segsz = 1450 + mbuf->outer_l2_len + mbuf->outer_l3_len +
++                              mbuf->l2_len;
++            if (mbuf->tso_segsz > dev->mtu) {
++                mbuf->tso_segsz = dev->mtu;
++            }
++        }
++    }
++
+     return true;
+ }
+ 
+@@ -2346,24 +2435,19 @@ netdev_dpdk_prep_hwol_batch(struct netdev_dpdk *dev, struct rte_mbuf **pkts,
+     return cnt;
+ }
+ 
+-/* Tries to transmit 'pkts' to txq 'qid' of device 'dev'.  Takes ownership of
+- * 'pkts', even in case of failure.
+- *
+- * Returns the number of packets that weren't transmitted. */
+ static inline int
+-netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+-                         struct rte_mbuf **pkts, int cnt)
++__netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
++                           struct rte_mbuf **pkts, int cnt)
+ {
+     uint32_t nb_tx = 0;
+-    uint16_t nb_tx_prep = cnt;
++    uint32_t nb_tx_prep;
+ 
+-    if (userspace_tso_enabled()) {
+-        nb_tx_prep = rte_eth_tx_prepare(dev->port_id, qid, pkts, cnt);
+-        if (nb_tx_prep != cnt) {
+-            VLOG_WARN_RL(&rl, "%s: Output batch contains invalid packets. "
+-                         "Only %u/%u are valid: %s", dev->up.name, nb_tx_prep,
+-                         cnt, rte_strerror(rte_errno));
+-        }
++    nb_tx_prep = rte_eth_tx_prepare(dev->port_id, qid, pkts, cnt);
++    if (nb_tx_prep != cnt) {
++        VLOG_WARN_RL(&rl, "%s: Output batch contains invalid packets. "
++                          "Only %u/%u are valid: %s",
++                     dev->up.name, nb_tx_prep,
++                     cnt, rte_strerror(rte_errno));
+     }
+ 
+     while (nb_tx != nb_tx_prep) {
+@@ -2391,6 +2475,200 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+     return cnt - nb_tx;
+ }
+ 
++static inline void
++set_multiseg_udptcp_cksum(struct rte_mbuf *mbuf)
++{
++    uint16_t l3_offset = mbuf->outer_l2_len + mbuf->outer_l3_len
++                         + mbuf->l2_len;
++    struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)
++        (rte_pktmbuf_mtod(mbuf, char *) + l3_offset);
++    struct rte_tcp_hdr *tcp_hdr;
++    uint32_t l4_hdr_len;
++    uint8_t *l4_hdr;
++    struct rte_mbuf *next = mbuf->next;
++    uint32_t cksum = 0;
++    uint16_t l4_proto;
++    uint32_t inner_cksum;
++
++    l4_proto = ipv4_hdr->next_proto_id;
++    if ((l4_proto != IPPROTO_UDP) && (l4_proto != IPPROTO_TCP)) {
++        return;
++    }
++
++    if (l4_proto == IPPROTO_TCP) {
++        /* For TCP GSO, inner TCP header is in every seg,
++         * TCP checksum has to be calculated by software.
++         */
++
++        l4_hdr_len = mbuf->data_len - l3_offset
++                     - sizeof(struct rte_ipv4_hdr);
++        l4_hdr = (uint8_t *)(ipv4_hdr + 1);
++        tcp_hdr = (struct rte_tcp_hdr *)l4_hdr;
++        tcp_hdr->cksum = 0;
++    }
++
++    /* Set inner ip checksum */
++    ipv4_hdr->hdr_checksum = 0;
++    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++
++    if (l4_proto == IPPROTO_TCP) {
++        cksum = rte_raw_cksum(l4_hdr, l4_hdr_len);
++    } else if (l4_proto == IPPROTO_UDP) {
++        if (next == NULL) {
++            /* It wasn't GSOed */
++            cksum = rte_raw_cksum(ipv4_hdr + 1,
++                                  ntohs(ipv4_hdr->total_length)
++                                      - sizeof(struct rte_ipv4_hdr));
++        } else {
++            cksum = 0;
++        }
++    }
++
++    /* It was GSOed */
++    while (next) {
++        cksum += rte_raw_cksum(rte_pktmbuf_mtod(next, char *), next->data_len);
++        next = next->next;
++    }
++
++    /* Save cksum to inner_cksum, outer udp checksum needs it */
++    inner_cksum = cksum;
++
++    cksum += rte_ipv4_phdr_cksum(ipv4_hdr, 0);
++    cksum = ((cksum & 0xffff0000) >> 16) + (cksum & 0xffff);
++    cksum = (~cksum) & 0xffff;
++    if (cksum == 0) {
++        cksum = 0xffff;
++    }
++
++    /* Set inner TCP checksum */
++    if (l4_proto == IPPROTO_TCP) {
++        tcp_hdr->cksum = (uint16_t)cksum;
++    }
++
++    /* Set outer udp checksum in case of VXLAN */
++    if (mbuf->outer_l2_len != 0) {
++        ipv4_hdr = (struct rte_ipv4_hdr *)
++            (rte_pktmbuf_mtod(mbuf, char *) + mbuf->outer_l2_len);
++        struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)
++            (ipv4_hdr + 1);
++
++        /* Set outer ip checksum */
++        ipv4_hdr->hdr_checksum = 0;
++        ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++
++        udp_hdr->dgram_cksum = 0;
++        cksum = rte_ipv4_phdr_cksum(ipv4_hdr, 0);
++        cksum += rte_raw_cksum(udp_hdr, mbuf->l2_len + mbuf->l3_len);
++        cksum += inner_cksum;
++        if (l4_proto == IPPROTO_TCP) {
++            cksum += tcp_hdr->cksum;
++        }
++        cksum = ((cksum & 0xffff0000) >> 16) + (cksum & 0xffff);
++        cksum = (~cksum) & 0xffff;
++        if (cksum == 0) {
++            cksum = 0xffff;
++        }
++        udp_hdr->dgram_cksum = (uint16_t)cksum;
++    }
++}
++
++/* Tries to transmit 'pkts' to txq 'qid' of device 'dev'.  Takes ownership of
++ * 'pkts', even in case of failure.
++ *
++ * Returns the number of packets that weren't transmitted. */
++static inline int
++netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
++                         struct rte_mbuf **pkts, int cnt)
++{
++    uint32_t nb_tx = 0;
++    int i;
++    int ret;
++    int failures = 0;
++
++    if (userspace_tso_enabled()) {
++        /* The best point to do gso */
++        struct rte_gso_ctx gso_ctx;
++        struct rte_mbuf *gso_mbufs[MAX_GSO_MBUFS];
++        int tx_start = -1;
++
++        /* Setup gso context */
++        gso_ctx.direct_pool = dev->dpdk_mp->mp;
++        gso_ctx.indirect_pool = dev->dpdk_mp->mp;
++
++        /* Do GSO if needed */
++        for (i = 0; i < cnt; i++) {
++            if (((pkts[i]->ol_flags & PKT_TX_UDP_SEG) &&
++                  !(dev->hw_ol_features & DEV_TX_OFFLOAD_UDP_TSO)) ||
++                ((pkts[i]->ol_flags & PKT_TX_TCP_SEG) &&
++                  ((!(dev->hw_ol_features & NETDEV_TX_VXLAN_TNL_TSO_OFFLOAD)
++                   && (pkts[i]->ol_flags & PKT_TX_TUNNEL_VXLAN))
++                   || !(dev->hw_ol_features & DEV_TX_OFFLOAD_TCP_TSO)))) {
++                /* Send non GSO packets before pkts[i] */
++                if (tx_start != -1) {
++                    failures += __netdev_dpdk_eth_tx_burst(
++                                    dev, qid,
++                                    pkts + tx_start,
++                                    i - tx_start);
++                }
++                tx_start = -1;
++
++                gso_ctx.gso_types = 0;
++                gso_ctx.gso_size = pkts[i]->tso_segsz;
++                gso_ctx.flag = 0;
++                if (pkts[i]->ol_flags & PKT_TX_TUNNEL_VXLAN) {
++                    gso_ctx.gso_types |= DEV_TX_OFFLOAD_VXLAN_TNL_TSO;
++                }
++                if (pkts[i]->ol_flags & PKT_TX_UDP_SEG) {
++                    gso_ctx.gso_types |= DEV_TX_OFFLOAD_UDP_TSO;
++                } else if (pkts[i]->ol_flags & PKT_TX_TCP_SEG) {
++                    gso_ctx.gso_types |= DEV_TX_OFFLOAD_TCP_TSO;
++                    pkts[i]->ol_flags &= ~PKT_TX_TCP_CKSUM;
++                }
++                ret = rte_gso_segment(pkts[i], /* packet to segment */
++                                      &gso_ctx, /* gso context */
++                                      /* gso output mbufs */
++                                      (struct rte_mbuf **)&gso_mbufs,
++                                      MAX_GSO_MBUFS);
++                if (ret < 0) {
++                    rte_pktmbuf_free(pkts[i]);
++                } else {
++                    int j, k;
++                    struct rte_mbuf * next_part;
++                    nb_tx = ret;
++                    for (j = 0; j < nb_tx; j++) {
++                        set_multiseg_udptcp_cksum(gso_mbufs[j]);
++                        /* Clear them because of no offload */
++                        gso_mbufs[j]->ol_flags = 0;
++                        gso_mbufs[j]->outer_l2_len = 0;
++                        gso_mbufs[j]->outer_l3_len = 0;
++                        gso_mbufs[j]->l2_len = 0;
++                        gso_mbufs[j]->l3_len = 0;
++                        gso_mbufs[j]->l4_len = 0;
++                        next_part = gso_mbufs[j];
++                        for (k = 0; k < gso_mbufs[j]->nb_segs; k++) {
++                            next_part = next_part->next;
++                        }
++                    }
++                    __netdev_dpdk_eth_tx_burst(dev, qid, gso_mbufs, nb_tx);
++                }
++                continue;
++            }
++            if (tx_start == -1) {
++                tx_start = i;
++            }
++        }
++
++        if (tx_start != -1) {
++            /* Send non GSO packets before pkts[i] */
++            failures += __netdev_dpdk_eth_tx_burst(dev, qid, pkts + tx_start,
++                                       i - tx_start);
++        }
++        return failures;
++    }
++
++    return __netdev_dpdk_eth_tx_burst(dev, qid, pkts, cnt);
++}
++
+ static inline bool
+ netdev_dpdk_srtcm_policer_pkt_handle(struct rte_meter_srtcm *meter,
+                                      struct rte_meter_srtcm_profile *profile,
+@@ -2793,10 +3071,24 @@ out:
+     }
+ }
+ 
++struct shinfo_arg {
++    void * buf;
++    struct rte_mbuf *mbuf;
++};
++
++/* For GSO case, the extended mbuf only can be freed by
++ * netdev_dpdk_extbuf_free
++ */
+ static void
+-netdev_dpdk_extbuf_free(void *addr OVS_UNUSED, void *opaque)
++netdev_dpdk_extbuf_free(struct rte_mbuf *m, void *opaque)
+ {
+-    rte_free(opaque);
++    struct shinfo_arg *arg = (struct shinfo_arg *)opaque;
++
++    rte_free(arg->buf);
++    if (m != arg->mbuf) {
++        rte_pktmbuf_free(arg->mbuf);
++    }
++    free(arg);
+ }
+ 
+ static struct rte_mbuf *
+@@ -2828,8 +3120,11 @@ dpdk_pktmbuf_attach_extbuf(struct rte_mbuf *pkt, uint32_t data_len)
+ 
+     /* Initialize shinfo. */
+     if (shinfo) {
++        struct shinfo_arg *arg = xmalloc(sizeof(struct shinfo_arg));
++        arg->buf = buf;
++        arg->mbuf = pkt;
+         shinfo->free_cb = netdev_dpdk_extbuf_free;
+-        shinfo->fcb_opaque = buf;
++        shinfo->fcb_opaque = arg;
+         rte_mbuf_ext_refcnt_set(shinfo, 1);
+     } else {
+         shinfo = rte_pktmbuf_ext_shinfo_init_helper(buf, &buf_len,
+@@ -2859,6 +3154,10 @@ dpdk_pktmbuf_alloc(struct rte_mempool *mp, uint32_t data_len)
+         return NULL;
+     }
+ 
++    if (unlikely(pkt->shinfo != NULL)) {
++        pkt->shinfo = NULL;
++    }
++
+     if (rte_pktmbuf_tailroom(pkt) >= data_len) {
+         return pkt;
+     }
+@@ -5199,6 +5498,7 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+     int err;
+     uint64_t vhost_flags = 0;
+     uint64_t vhost_unsup_flags;
++    uint64_t vhost_supported_flags;
+     bool zc_enabled;
+ 
+     ovs_mutex_lock(&dev->mutex);
+@@ -5292,6 +5592,16 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+             goto unlock;
+         }
+ 
++        err = rte_vhost_driver_get_features(dev->vhost_id,
++                                            &vhost_supported_flags);
++        if (err) {
++            VLOG_ERR("rte_vhost_driver_get_features failed for "
++                     "vhost user client port: %s\n", dev->up.name);
++            goto unlock;
++        }
++        VLOG_INFO("vhostuserclient port %s features: 0x%016lx",
++                  dev->up.name, vhost_supported_flags);
++
+         err = rte_vhost_driver_start(dev->vhost_id);
+         if (err) {
+             VLOG_ERR("rte_vhost_driver_start failed for vhost user "
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 9f830b4c4..557f139fd 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -6566,6 +6566,16 @@ netdev_linux_parse_l2(struct dp_packet *b, uint16_t *l4proto)
+ 
+         l4_len = TCP_OFFSET(tcp_hdr->tcp_ctl) * 4;
+         dp_packet_hwol_set_l4_len(b, l4_len);
++    } else if (*l4proto == IPPROTO_UDP) {
++        struct udp_header *udp_hdr =  dp_packet_at(b, l2_len + l3_len,
++                                          sizeof(struct udp_header));
++
++        if (!udp_hdr) {
++            return -EINVAL;
++        }
++
++        l4_len = sizeof(struct udp_header);
++        dp_packet_hwol_set_l4_len(b, l4_len);
+     }
+ 
+     return 0;
+@@ -6581,10 +6591,6 @@ netdev_linux_parse_vnet_hdr(struct dp_packet *b)
+         return -EINVAL;
+     }
+ 
+-    if (vnet->flags == 0 && vnet->gso_type == VIRTIO_NET_HDR_GSO_NONE) {
+-        return 0;
+-    }
+-
+     if (netdev_linux_parse_l2(b, &l4proto)) {
+         return -EINVAL;
+     }
+@@ -6609,6 +6615,9 @@ netdev_linux_parse_vnet_hdr(struct dp_packet *b)
+             || type == VIRTIO_NET_HDR_GSO_TCPV6) {
+             dp_packet_hwol_set_tcp_seg(b);
+         }
++        if (type == VIRTIO_NET_HDR_GSO_UDP) {
++            dp_packet_hwol_set_udp_seg(b);
++        }
+     }
+ 
+     return 0;
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 64583d1c3..02f28c81f 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -825,23 +825,41 @@ netdev_send_prepare_packet(const uint64_t netdev_flags,
+ {
+     uint64_t l4_mask;
+ 
+-    if (dp_packet_hwol_is_vxlan_tcp_seg(packet)
+-        && (dp_packet_hwol_is_tso(packet) || dp_packet_hwol_l4_mask(packet))
+-        && !(netdev_flags & NETDEV_TX_OFFLOAD_VXLAN_TSO)) {
+-        /* Fall back to GSO in software. */
+-        VLOG_ERR_BUF(errormsg, "No VXLAN TSO support");
+-        return false;
+-    }
+-
+-    if (dp_packet_hwol_is_tso(packet)
+-        && !(netdev_flags & NETDEV_TX_OFFLOAD_TCP_TSO)) {
+-            /* Fall back to GSO in software. */
+-            VLOG_ERR_BUF(errormsg, "No TSO support");
+-            return false;
+-    }
+-
++    /* GSO can handle TSO by software even if device can't handle hardware
++     * offload, so needn't check it here.
++     */
+     l4_mask = dp_packet_hwol_l4_mask(packet);
+     if (l4_mask) {
++        /* Calculate checksum for VLAN TSO case when no hardware offload
++         * feature is available. Note: for VXLAN TSO case, checksum has
++         * been calculated before here, so it won't be done here again
++         * because checksum flags in packet->m.ol_flags have been cleaned.
++         */
++        if (dp_packet_hwol_l4_is_tcp(packet)
++            && !dp_packet_hwol_is_vxlan_tcp_seg(packet)
++            && !(netdev_flags & NETDEV_TX_OFFLOAD_TCP_CKSUM)) {
++            packet->mbuf.ol_flags &= ~DP_PACKET_OL_TX_TCP_CKSUM;
++            /* Only calculate TCP checksum for non-TSO packet,
++             * it will be calculated after GSO for TSO packet.
++             */
++            if (!(packet->mbuf.ol_flags & DP_PACKET_OL_TX_TCP_SEG)) {
++                calculate_tcpudp_checksum(packet);
++            }
++            return true;
++        } else if (dp_packet_hwol_l4_is_udp(packet)
++            && !dp_packet_hwol_is_vxlan_tcp_seg(packet)
++            && !(netdev_flags & NETDEV_TX_OFFLOAD_UDP_CKSUM)) {
++            packet->mbuf.ol_flags &= ~DP_PACKET_OL_TX_UDP_CKSUM;
++            /* Only calculate UDP checksum for non-UFO packet,
++             * it will be calculated immediately before GSO for
++             * UFO packet.
++             */
++            if (!(packet->mbuf.ol_flags & DP_PACKET_OL_TX_UDP_SEG)) {
++                calculate_tcpudp_checksum(packet);
++            }
++            return true;
++        }
++
+         if (dp_packet_hwol_l4_is_tcp(packet)) {
+             if (!(netdev_flags & NETDEV_TX_OFFLOAD_TCP_CKSUM)) {
+                 /* Fall back to TCP csum in software. */
+@@ -1013,11 +1031,26 @@ netdev_push_header(const struct netdev *netdev,
+                 /* VXLAN offload can't support udp checksum offload
+                  * for inner udp packet, so udp checksum must be set
+                  * before push header in order that outer checksum can
+-                 * be set correctly.
++                 * be set correctly. But GSO code will set udp checksum
++                 * if packet->mbuf.ol_flags has DP_PACKET_OL_TX_UDP_SEG.
+                  */
+                 if (dp_packet_hwol_l4_is_udp(packet)) {
+                     packet->mbuf.ol_flags &= ~DP_PACKET_OL_TX_UDP_CKSUM;
+-                    calculate_tcpudp_checksum(packet);
++                    /* Only calculate UDP checksum for non-UFO packet,
++                     * it will be calculated immediately before GSO for
++                     * UFO packet.
++                     */
++                    if (!(packet->mbuf.ol_flags & DP_PACKET_OL_TX_UDP_SEG)) {
++                        calculate_tcpudp_checksum(packet);
++                    }
++                } else if (dp_packet_hwol_l4_is_tcp(packet)) {
++                    packet->mbuf.ol_flags &= ~DP_PACKET_OL_TX_TCP_CKSUM;
++                    /* Only calculate TCP checksum for non-TSO packet,
++                     * it will be calculated after GSO for TSO packet.
++                     */
++                    if (!(packet->mbuf.ol_flags & DP_PACKET_OL_TX_TCP_SEG)) {
++                        calculate_tcpudp_checksum(packet);
++                    }
+                 }
+             }
+             netdev->netdev_class->push_header(netdev, packet, data);
+-- 
+2.17.1
+

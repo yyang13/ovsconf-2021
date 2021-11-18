@@ -1,0 +1,79 @@
+From 0c2ba46a9b2a2f6faef55d90d0cfd2305d0bee5e Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Mon, 26 Oct 2020 05:46:37 -0400
+Subject: [PATCH 22/47] Fix small TCP/UDP packet checksum issue for IPv6
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev.c | 40 ++++++++++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 6d30eebda..305112142 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -796,8 +796,9 @@ netdev_get_pt_mode(const struct netdev *netdev)
+ static inline void
+ calculate_tcpudp_checksum(struct dp_packet *p)
+ {
+-    uint32_t pseudo_hdr_csum;
+-    struct ip_header *ip = dp_packet_l3(p);
++    uint32_t pseudo_hdr_csum = 0;
++    bool is_ipv6 = false;
++    struct ovs_16aligned_ip6_hdr *ip6 = NULL;
+     size_t len_l2 = (char *) dp_packet_l3(p) - (char *) dp_packet_eth(p);
+     size_t len_l3 = (char *) dp_packet_l4(p) - (char *) dp_packet_l3(p);
+     size_t l4_len = (char *) dp_packet_tail(p) - (char *) dp_packet_l4(p);
+@@ -809,22 +810,41 @@ calculate_tcpudp_checksum(struct dp_packet *p)
+         dp_packet_hwol_set_l3_len(p, len_l3);
+     }
+ 
+-    l4_proto = ip->ip_proto;
+-    ip->ip_csum = 0;
+-    ip->ip_csum = csum(ip, sizeof *ip);
+-    pseudo_hdr_csum = packet_csum_pseudoheader(ip);
++    if (len_l3 == sizeof(struct ovs_16aligned_ip6_hdr)) {
++        ip6 = dp_packet_l3(p);
++        l4_proto = ip6->ip6_ctlun.ip6_un1.ip6_un1_nxt;
++        is_ipv6 = true;
++    } else {
++        struct ip_header *ip = dp_packet_l3(p);
++
++        l4_proto = ip->ip_proto;
++        ip->ip_csum = 0;
++        ip->ip_csum = csum(ip, sizeof *ip);
++        pseudo_hdr_csum = packet_csum_pseudoheader(ip);
++    }
++
+     if (l4_proto == IPPROTO_TCP) {
+         struct tcp_header *tcp = dp_packet_l4(p);
+ 
+         tcp->tcp_csum = 0;
+-        tcp->tcp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
+-                                                  tcp, l4_len));
++        if (is_ipv6) {
++            tcp->tcp_csum = packet_csum_upperlayer6(ip6, tcp, l4_proto,
++                                                    l4_len);
++        } else {
++            tcp->tcp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
++                                                      tcp, l4_len));
++        }
+     } else if (l4_proto == IPPROTO_UDP) {
+         struct udp_header *udp = dp_packet_l4(p);
+ 
+         udp->udp_csum = 0;
+-        udp->udp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
+-                                                  udp, l4_len));
++        if (is_ipv6) {
++            udp->udp_csum = packet_csum_upperlayer6(ip6, udp, l4_proto,
++                                                    l4_len);
++        } else {
++            udp->udp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
++                                                      udp, l4_len));
++        }
+         if (!udp->udp_csum) {
+             udp->udp_csum = htons(0xffff);
+         }
+-- 
+2.17.1
+

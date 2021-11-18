@@ -1,0 +1,345 @@
+From bf490d438c47f8ee6d72defbcee880c231a88aeb Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Thu, 22 Apr 2021 04:37:27 -0400
+Subject: [PATCH 45/47] Remove TPACKET_V3 support
+
+Note: TPACKET_V3 will introduce big latency, and its performance
+is worse than original syscall-based batch process. So TPACKET_V2
+is the best option for TSO and non-TSO case.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-linux.c          | 249 ++----------------------------------
+ lib/userspace-use-tpacket.c |   5 +-
+ 2 files changed, 13 insertions(+), 241 deletions(-)
+
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 87d5beeea..78c2623ac 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -1158,30 +1158,13 @@ netdev_linux_sock_batch_send(int sock, int ifindex,
+ 
+ #ifdef HAVE_TPACKET_V3
+ static int
+-netdev_linux_batch_recv_tpacket_v3(struct netdev_rxq_linux *rx, bool tso,
+-                                   int mtu OVS_UNUSED,
+-                                   struct dp_packet_batch *batch);
+-static int
+ netdev_linux_batch_recv_tpacket_v2(struct netdev_rxq_linux *rx, bool tso,
+                                    int mtu OVS_UNUSED,
+                                    struct dp_packet_batch *batch);
+ static int
+-netdev_linux_tpacket_batch_send_v3(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
+-                                   struct netdev *netdev_, bool tso, int mtu,
+-                                   struct dp_packet_batch *batch);
+-static int
+ netdev_linux_tpacket_batch_send_v2(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
+                                    struct netdev *netdev_, bool tso, int mtu,
+                                    struct dp_packet_batch *batch);
+-static inline struct tpacket3_hdr *
+-tpacket_get_next_frame_v3(struct tpacket_ring *ring, uint32_t frame_num)
+-{
+-    uint8_t *f0 = ring->rd[0].iov_base;
+-
+-    return ALIGNED_CAST(struct tpacket3_hdr *,
+-               f0 + (frame_num * ring->req3.tp_frame_size));
+-}
+-
+ static inline struct tpacket2_hdr *
+ tpacket_get_next_frame_v2(struct tpacket_ring *ring, uint32_t frame_num)
+ {
+@@ -1217,39 +1200,6 @@ tpacket_v1_v2_fill_ring(struct tpacket_ring *ring, unsigned int blocks)
+     ring->flen = ring->req.tp_frame_size;
+ }
+ 
+-static inline void
+-tpacket_fill_ring(struct tpacket_ring *ring, unsigned int blocks, int type)
+-{
+-    if (type == PACKET_RX_RING) {
+-        ring->req3.tp_retire_blk_tov = 1;
+-        ring->req3.tp_sizeof_priv = 0;
+-        ring->req3.tp_feature_req_word = 0;
+-    }
+-
+-    if (userspace_tso_enabled()) {
+-        /* For TX ring, the whole packet must be in one frame
+-         * so tp_frame_size must big enough to accommodate
+-         * 64K packet, tpacket3_hdr will occupy some bytes,
+-         * the final frame size is 64K + 4K = 68K.
+-         */
+-        ring->req3.tp_frame_size = (getpagesize() << 4) + getpagesize();
+-        ring->req3.tp_block_size = ring->req3.tp_frame_size;
+-    } else {
+-        ring->req3.tp_block_size = getpagesize() << 2;
+-        ring->req3.tp_frame_size = TPACKET_ALIGNMENT << 7;
+-    }
+-
+-    ring->req3.tp_block_nr = blocks;
+-
+-    ring->req3.tp_frame_nr = ring->req3.tp_block_size /
+-                             ring->req3.tp_frame_size *
+-                             ring->req3.tp_block_nr;
+-
+-    ring->mm_len = ring->req3.tp_block_size * ring->req3.tp_block_nr;
+-    ring->rd_num = ring->req3.tp_block_nr;
+-    ring->flen = ring->req3.tp_block_size;
+-}
+-
+ static inline int
+ tpacket_set_packet_loss_discard(int sock)
+ {
+@@ -1273,20 +1223,13 @@ tpacket_setup_ring(int sock, struct tpacket_ring *ring, int type)
+     }
+     ring->type = type;
+ 
+-    if (!tso) {
+-        /* Use TPACKET_V3 for non-TSO case */
+-        tpacket_fill_ring(ring, blocks, type);
+-        ret = setsockopt(sock, SOL_PACKET, type, &ring->req3,
+-                         sizeof(ring->req3));
+-    } else {
+-        /* Use TPACKET_V2 for TSO case */
+-        if (type == PACKET_TX_RING) {
+-            tpacket_set_packet_loss_discard(sock);
+-        }
+-        tpacket_v1_v2_fill_ring(ring, blocks);
+-        ret = setsockopt(sock, SOL_PACKET, type, &ring->req,
+-                         sizeof(ring->req));
++    /* Use TPACKET_V2 for all the cases */
++    if (type == PACKET_TX_RING) {
++        tpacket_set_packet_loss_discard(sock);
+     }
++    tpacket_v1_v2_fill_ring(ring, blocks);
++    ret = setsockopt(sock, SOL_PACKET, type, &ring->req,
++                     sizeof(ring->req));
+ 
+     if (ret == -1) {
+         return -1;
+@@ -1401,20 +1344,12 @@ netdev_linux_rxq_construct(struct netdev_rxq *rxq_)
+ 
+ #ifdef HAVE_TPACKET_V3
+         if (use_tpacket) {
+-            static int ver = TPACKET_V3;
+-            if (!tso) {
+-                ver = TPACKET_V3;
+-                netdev_linux_batch_recv =
+-                    &netdev_linux_batch_recv_tpacket_v3;
+-                netdev_linux_batch_send =
+-                    &netdev_linux_tpacket_batch_send_v3;
+-            } else {
+-                ver = TPACKET_V2;
+-                netdev_linux_batch_recv =
+-                    &netdev_linux_batch_recv_tpacket_v2;
+-                netdev_linux_batch_send =
+-                    &netdev_linux_tpacket_batch_send_v2;
+-            }
++            static int ver = TPACKET_V2;
++            ver = TPACKET_V2;
++            netdev_linux_batch_recv =
++                &netdev_linux_batch_recv_tpacket_v2;
++            netdev_linux_batch_send =
++                &netdev_linux_tpacket_batch_send_v2;
+ 
+             /* TPACKET_V3 ring setup must be after setsockopt
+              * PACKET_VNET_HDR because PACKET_VNET_HDR will return error
+@@ -2180,12 +2115,6 @@ netdev_linux_get_numa_id(const struct netdev *netdev_)
+ }
+ 
+ #ifdef HAVE_TPACKET_V3
+-static inline int
+-tpacket_tx_is_ready_v3(struct tpacket3_hdr *hdr)
+-{
+-    return !(hdr->tp_status & (TP_STATUS_SEND_REQUEST | TP_STATUS_SENDING));
+-}
+-
+ static inline int
+ tpacket_tx_is_ready_v2(struct tpacket2_hdr *hdr)
+ {
+@@ -2209,62 +2138,6 @@ kick_off_tpacket_send(int sockfd, struct netdev_linux *netdev,
+     }
+ }
+ 
+-static int
+-netdev_linux_tpacket_batch_send_v3(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
+-                                   struct netdev *netdev_, bool tso, int mtu,
+-                                   struct dp_packet_batch *batch)
+-{
+-    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+-    struct dp_packet *packet;
+-    int total_pkts = 0;
+-    unsigned int tpacket_hdr_len = TPACKET3_HDRLEN;
+-    unsigned int frame_nr = netdev->tp_tx_ring->req3.tp_frame_nr;
+-    unsigned int frame_num = netdev->tp_tx_ring->frame_num;
+-    struct tpacket3_hdr *ppd;
+-
+-    /* The Linux tap driver returns EIO if the device is not up,
+-     * so if the device is not up, don't waste time sending it.
+-     * However, if the device is in another network namespace
+-     * then OVS can't retrieve the state. In that case, send the
+-     * packets anyway. */
+-    if (netdev->present && !(netdev->ifi_flags & IFF_UP)) {
+-        netdev->tx_dropped += dp_packet_batch_size(batch);
+-        return 0;
+-    }
+-
+-    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+-        size_t size;
+-
+-        if (tso) {
+-            netdev_linux_prepend_vnet_hdr(packet, mtu);
+-        }
+-
+-        size = dp_packet_size(packet);
+-        ppd = tpacket_get_next_frame_v3(netdev->tp_tx_ring, frame_num);
+-
+-        if (!tpacket_tx_is_ready_v3(ppd)) {
+-            break;
+-        }
+-        ppd->tp_snaplen = size;
+-        ppd->tp_len = size;
+-        ppd->tp_next_offset = 0;
+-
+-        memcpy((uint8_t *)ppd + tpacket_hdr_len - sizeof(struct sockaddr_ll),
+-               dp_packet_data(packet),
+-               size);
+-        ppd->tp_status = TP_STATUS_SEND_REQUEST;
+-        frame_num = (frame_num + 1) % frame_nr;
+-        total_pkts++;
+-    }
+-    netdev->tp_tx_ring->frame_num = frame_num;
+-
+-    /* Kick-off transmits */
+-    if (total_pkts != 0) {
+-        kick_off_tpacket_send(netdev->tp_tx_ring->sockfd, netdev, batch);
+-    }
+-    return 0;
+-}
+-
+ static int
+ netdev_linux_tpacket_batch_send_v2(int sock OVS_UNUSED, int ifindex OVS_UNUSED,
+                                    struct netdev *netdev_, bool tso, int mtu,
+@@ -4537,104 +4410,6 @@ codel_install__(struct netdev *netdev_, uint32_t target, uint32_t limit,
+ }
+ 
+ #ifdef HAVE_TPACKET_V3
+-static int
+-netdev_linux_batch_recv_tpacket_v3(struct netdev_rxq_linux *rx, bool tso,
+-                                int mtu OVS_UNUSED,
+-                                struct dp_packet_batch *batch)
+-{
+-    struct netdev *netdev_ = netdev_rxq_get_netdev(&rx->up);
+-    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+-    struct dp_packet *buffer;
+-    int i = 0;
+-    unsigned int block_num;
+-    unsigned int fn_in_block;
+-    struct tpacket_block_desc *pbd;
+-    struct tpacket3_hdr *ppd;
+-    int virtio_net_hdr_size;
+-
+-#ifdef DPDK_NETDEV
+-    if (rx->dpdk_mp == NULL) {
+-        dpdk_mp_create_for_nondpdk_ports(&rx->dpdk_mp,
+-                                         netdev_get_name(rx->up.netdev),
+-                                         mtu);
+-    }
+-#endif
+-
+-    if (tso) {
+-        virtio_net_hdr_size = sizeof(struct virtio_net_hdr);
+-    } else {
+-        virtio_net_hdr_size = 0;
+-    }
+-
+-    ppd = ALIGNED_CAST(struct tpacket3_hdr *, netdev->tp_rx_ring->ppd);
+-    block_num = netdev->tp_rx_ring->block_num;
+-    fn_in_block = netdev->tp_rx_ring->frame_num_in_block;
+-    pbd = ALIGNED_CAST(struct tpacket_block_desc *,
+-              netdev->tp_rx_ring->rd[block_num].iov_base);
+-
+-    while (i < NETDEV_MAX_BURST) {
+-        if ((pbd->hdr.bh1.block_status & TP_STATUS_USER) == 0) {
+-            break;
+-        }
+-        if (fn_in_block == 0) {
+-            ppd = ALIGNED_CAST(struct tpacket3_hdr *, (uint8_t *) pbd +
+-                                   pbd->hdr.bh1.offset_to_first_pkt);
+-        }
+-
+-#ifdef DPDK_NETDEV
+-        dpdk_dp_packet_new_with_headroom(
+-            rx->dpdk_mp,
+-            ppd->tp_snaplen + virtio_net_hdr_size + VLAN_ETH_HEADER_LEN,
+-            &buffer);
+-#else
+-        buffer = dp_packet_new_with_headroom(
+-                     ppd->tp_snaplen + virtio_net_hdr_size
+-                         + VLAN_ETH_HEADER_LEN, DP_NETDEV_HEADROOM);
+-#endif
+-        memcpy(dp_packet_data(buffer), (uint8_t *)ppd + ppd->tp_mac
+-                                           - virtio_net_hdr_size,
+-               ppd->tp_snaplen + virtio_net_hdr_size);
+-        dp_packet_set_size(buffer, ppd->tp_snaplen + virtio_net_hdr_size);
+-
+-        if (virtio_net_hdr_size && netdev_linux_parse_vnet_hdr(buffer)) {
+-            /* Unexpected error situation: the virtio header is not present
+-             * or corrupted. Drop the packet but continue in case next ones
+-             * are correct. */
+-            dp_packet_delete(buffer);
+-            netdev->rx_dropped += 1;
+-            VLOG_WARN_RL(&rl, "%s: Dropped packet: Invalid virtio net header",
+-                         netdev_get_name(netdev_));
+-        } else {
+-            if (ppd->tp_status & TP_STATUS_VLAN_VALID) {
+-                push_vlan_to_dp_packet(ppd->tp_status, ppd->hv1.tp_vlan_tpid,
+-                                       ppd->hv1.tp_vlan_tci, buffer);
+-            }
+-            dp_packet_batch_add(batch, buffer);
+-        }
+-
+-        fn_in_block++;
+-        if (fn_in_block >= pbd->hdr.bh1.num_pkts) {
+-            pbd->hdr.bh1.block_status = TP_STATUS_KERNEL;
+-            block_num = (block_num + 1) %
+-                            netdev->tp_rx_ring->req3.tp_block_nr;
+-            pbd = (struct tpacket_block_desc *)
+-                     netdev->tp_rx_ring->rd[block_num].iov_base;
+-            fn_in_block = 0;
+-            ppd = NULL;
+-        } else {
+-            ppd = ALIGNED_CAST(struct tpacket3_hdr *,
+-                   (uint8_t *) ppd + ppd->tp_next_offset);
+-        }
+-        i++;
+-    }
+-
+-    netdev->tp_rx_ring->block_num = block_num;
+-    netdev->tp_rx_ring->frame_num_in_block = fn_in_block;
+-    netdev->tp_rx_ring->ppd = ppd;
+-
+-    return 0;
+-}
+-
+ static int
+ netdev_linux_batch_recv_tpacket_v2(struct netdev_rxq_linux *rx, bool tso,
+                                 int mtu OVS_UNUSED,
+diff --git a/lib/userspace-use-tpacket.c b/lib/userspace-use-tpacket.c
+index cde998186..56f5acc97 100644
+--- a/lib/userspace-use-tpacket.c
++++ b/lib/userspace-use-tpacket.c
+@@ -35,11 +35,8 @@ userspace_use_tpacket_init(const struct smap *ovs_other_config)
+ 
+     if (ovsthread_once_start(&once)) {
+ #ifdef HAVE_TPACKET_V3
+-        int tpacket_ver = 3;
++        int tpacket_ver = 2;
+ 
+-        if (userspace_tso_enabled()) {
+-            tpacket_ver = 2;
+-        }
+         if (smap_get_bool(ovs_other_config, "userspace-use-tpacket", true)) {
+ #ifdef DPDK_NETDEV
+             VLOG_INFO("Userspace is using tpacket v%d", tpacket_ver);
+-- 
+2.17.1
+

@@ -1,0 +1,60 @@
+From 4c3717d7ba7397be0a8b4c0ceca0dc17e4e685ce Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 20 Sep 2020 23:10:53 -0400
+Subject: [PATCH 17/47] Enable UFO for vhostuserclient
+
+UFO can help improve UDP performance, in case that UDP
+payload size is 8192, it can boost UDP peroformance from
+about 3G to about 8G, it's really a dramatic improvement.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 1d8e3b6a1..0da1e51b1 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -5742,7 +5742,7 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+     int err;
+     uint64_t vhost_flags = 0;
+-    uint64_t vhost_unsup_flags;
++    uint64_t vhost_unsup_flags = 0;
+     uint64_t vhost_supported_flags;
+     bool zc_enabled;
+ 
+@@ -5820,8 +5820,6 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+             netdev->ol_flags |= NETDEV_TX_OFFLOAD_UDP_CKSUM;
+             netdev->ol_flags |= NETDEV_TX_OFFLOAD_SCTP_CKSUM;
+             netdev->ol_flags |= NETDEV_TX_OFFLOAD_IPV4_CKSUM;
+-            vhost_unsup_flags = 1ULL << VIRTIO_NET_F_HOST_ECN
+-                                | 1ULL << VIRTIO_NET_F_HOST_UFO;
+         } else {
+             /* This disables checksum offloading and all the features
+              * that depends on it (TSO, UFO, ECN) according to virtio
+@@ -5829,12 +5827,14 @@ netdev_dpdk_vhost_client_reconfigure(struct netdev *netdev)
+             vhost_unsup_flags = 1ULL << VIRTIO_NET_F_CSUM;
+         }
+ 
+-        err = rte_vhost_driver_disable_features(dev->vhost_id,
+-                                                vhost_unsup_flags);
+-        if (err) {
+-            VLOG_ERR("rte_vhost_driver_disable_features failed for "
+-                     "vhost user client port: %s\n", dev->up.name);
+-            goto unlock;
++        if (vhost_unsup_flags != 0) {
++            err = rte_vhost_driver_disable_features(dev->vhost_id,
++                                                    vhost_unsup_flags);
++            if (err) {
++                VLOG_ERR("rte_vhost_driver_disable_features failed for "
++                         "vhost user client port: %s\n", dev->up.name);
++                goto unlock;
++            }
+         }
+ 
+         err = rte_vhost_driver_get_features(dev->vhost_id,
+-- 
+2.17.1
+

@@ -1,0 +1,194 @@
+From 3db0c35295c44a7fb31493a1fe94998d61e620a3 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Tue, 3 Nov 2020 22:43:43 -0500
+Subject: [PATCH 24/47] Fix ipv6 udp issue in iperf3
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/dp-packet.h   | 46 ++++++++++++++++++++++++++++++++++++++++++
+ lib/netdev-dpdk.c | 51 +++++++++++++++++++++++++++++++++++------------
+ lib/netdev.c      |  2 --
+ 3 files changed, 84 insertions(+), 15 deletions(-)
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 6ad0b7e29..50b61113e 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -85,6 +85,10 @@ enum dp_packet_offload_mask {
+     DEF_OL_FLAG(DP_PACKET_OL_TX_TUNNEL_VXLAN, PKT_TX_TUNNEL_VXLAN, 0x1000),
+     /* UDP Segmentation Offload. */
+     DEF_OL_FLAG(DP_PACKET_OL_TX_UDP_SEG, PKT_TX_UDP_SEG, 0x2000),
++    /* Outer L3 Type IPV4 For Tunnel Offload. */
++    DEF_OL_FLAG(DP_PACKET_OL_TX_OUTER_IPV4, PKT_TX_OUTER_IPV4, 0x4000),
++    /* Outer L3 Type IPV6 For Tunnel Offload. */
++    DEF_OL_FLAG(DP_PACKET_OL_TX_OUTER_IPV6, PKT_TX_OUTER_IPV6, 0x8000),
+     /* Adding new field requires adding to DP_PACKET_OL_SUPPORTED_MASK. */
+ };
+ 
+@@ -1020,6 +1024,48 @@ dp_packet_hwol_set_tx_ipv6(struct dp_packet *b)
+     *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_IPV6;
+ }
+ 
++/* Mark packet 'b' for Outer IPv4 checksum offloading. */
++static inline void
++dp_packet_hwol_set_tx_outer_ipv4(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_OUTER_IPV4;
++}
++
++/* Check if packet 'b' has Outer IPv4 checksum offloading. */
++static inline bool
++dp_packet_hwol_is_tx_outer_ipv4(struct dp_packet *b)
++{
++    return (*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_OUTER_IPV4);
++}
++
++/* Reset packet 'b' for Outer IPv4 checksum offloading. */
++static inline void
++dp_packet_hwol_reset_tx_outer_ipv4(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) &= ~DP_PACKET_OL_TX_OUTER_IPV4;
++}
++
++/* Mark packet 'b' for Outer IPv6 checksum offloading. */
++static inline void
++dp_packet_hwol_set_tx_outer_ipv6(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) |= DP_PACKET_OL_TX_OUTER_IPV6;
++}
++
++/* Check if packet 'b' has Outer IPv6 checksum offloading. */
++static inline bool
++dp_packet_hwol_is_tx_outer_ipv6(struct dp_packet *b)
++{
++    return (*dp_packet_ol_flags_ptr(b) & DP_PACKET_OL_TX_OUTER_IPV6);
++}
++
++/* Reset packet 'b' for Outer IPv6 checksum offloading. */
++static inline void
++dp_packet_hwol_reset_tx_outer_ipv6(struct dp_packet *b)
++{
++    *dp_packet_ol_flags_ptr(b) &= ~DP_PACKET_OL_TX_OUTER_IPV6;
++}
++
+ /* Mark packet 'b' for TCP checksum offloading.  It implies that either
+  * the packet 'b' is marked for IPv4 or IPv6 checksum offloading. */
+ static inline void
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 82339241d..b9f167b8d 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2226,10 +2226,13 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      * Such packets are only for local VMs or namespaces, so need to return
+      * after ol_flags, l2_len, l3_len and tso_segsz are set.
+      */
+-    if (((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
+-        (mbuf->l2_len == UDP_VXLAN_ETH_HDR_SIZE) &&
+-        (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN))) {
++    if ((mbuf->outer_l2_len != 0) && (mbuf->outer_l3_len != 0) &&
++        ((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
++        (mbuf->l2_len == UDP_VXLAN_ETH_HDR_SIZE)) {
++        mbuf->outer_l2_len = 0;
++        mbuf->outer_l3_len = 0;
+         mbuf->ol_flags = 0;
++        mbuf->tso_segsz = 0;
+         mbuf->l2_len -= sizeof(struct udp_header)
+                         + sizeof(struct vxlanhdr);
+         if (mbuf->l3_len == IP_HEADER_LEN) {
+@@ -2245,17 +2248,23 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         }
+ 
+         if (l4_proto == IPPROTO_TCP) {
+-            mbuf->ol_flags |= PKT_TX_TCP_SEG;
+-            mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
++            if (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN)) {
++                mbuf->ol_flags |= PKT_TX_TCP_SEG;
++                mbuf->ol_flags |= PKT_TX_TCP_CKSUM;
++            }
+         } else if (l4_proto == IPPROTO_UDP) {
+-            mbuf->ol_flags |= PKT_TX_UDP_SEG;
+-            mbuf->ol_flags |= PKT_TX_UDP_CKSUM;
++            if (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN)) {
++                mbuf->ol_flags |= PKT_TX_UDP_SEG;
++                mbuf->ol_flags |= PKT_TX_UDP_CKSUM;
++            }
+         }
+-        mbuf->tso_segsz = tso_segsz;
+-        if (mbuf->tso_segsz > dev->mtu) {
+-            mbuf->tso_segsz = dev->mtu;
++        if (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN)) {
++            mbuf->tso_segsz = tso_segsz;
++            if (mbuf->tso_segsz > dev->mtu) {
++                mbuf->tso_segsz = dev->mtu;
++            }
++            mbuf->tso_segsz += mbuf->l2_len;
+         }
+-        mbuf->tso_segsz += mbuf->l2_len;
+ 
+         return true;
+     }
+@@ -2994,23 +3003,25 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+             ((char *)eth_hdr + l2_len);
+ 
+         l3_len = IP_HEADER_LEN;
+-        dp_packet_hwol_set_tx_ipv4(pkt);
+         *l4_proto = ipv4_hdr->next_proto_id;
+         *is_frag = rte_ipv4_frag_pkt_is_fragmented(ipv4_hdr);
+         if (offset == 0) {
++            dp_packet_hwol_set_tx_outer_ipv4(pkt);
+             mbuf->packet_type |= RTE_PTYPE_L3_IPV4;
+         } else {
++            dp_packet_hwol_set_tx_ipv4(pkt);
+             mbuf->packet_type |= RTE_PTYPE_INNER_L3_IPV4;
+         }
+     } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
+         struct rte_ipv6_hdr *ipv6_hdr = (struct rte_ipv6_hdr *)
+             ((char *)eth_hdr + l2_len);
+         l3_len = IPV6_HEADER_LEN;
+-        dp_packet_hwol_set_tx_ipv6(pkt);
+         *l4_proto = ipv6_hdr->proto;
+         if (offset == 0) {
++            dp_packet_hwol_set_tx_outer_ipv6(pkt);
+             mbuf->packet_type |= RTE_PTYPE_L3_IPV6;
+         } else {
++            dp_packet_hwol_set_tx_ipv6(pkt);
+             mbuf->packet_type |= RTE_PTYPE_INNER_L3_IPV6;
+         }
+     }
+@@ -3053,6 +3064,20 @@ netdev_dpdk_parse_hdr(struct dp_packet *pkt, int offset, uint16_t *l4_proto,
+                 mbuf->packet_type |= RTE_PTYPE_INNER_L4_UDP;
+                 mbuf->packet_type |= RTE_PTYPE_L4_UDP;
+             }
++            *l4_proto = inner_l4_proto;
++        }
++    }
++
++    if ((offset == 0) &&
++        ((mbuf->packet_type & RTE_PTYPE_TUNNEL_VXLAN) == 0)) {
++        if (dp_packet_hwol_is_tx_outer_ipv4(pkt)) {
++            dp_packet_hwol_reset_tx_outer_ipv4(pkt);
++            dp_packet_hwol_set_tx_ipv4(pkt);
++        }
++
++        if (dp_packet_hwol_is_tx_outer_ipv6(pkt)) {
++            dp_packet_hwol_reset_tx_outer_ipv6(pkt);
++            dp_packet_hwol_set_tx_ipv6(pkt);
+         }
+     }
+ }
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 305112142..94ed1c934 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -1008,8 +1008,6 @@ netdev_pop_header(struct netdev *netdev, struct dp_packet_batch *batch)
+              * interpretation in the further packet processing when
+              * recirculated.*/
+             dp_packet_reset_offload(packet);
+-            dp_packet_hwol_set_outer_l2_len(packet, 0);
+-            dp_packet_hwol_set_outer_l3_len(packet, 0);
+             pkt_metadata_init_conn(&packet->md);
+             dp_packet_batch_refill(batch, packet, i);
+         }
+-- 
+2.17.1
+

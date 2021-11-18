@@ -1,0 +1,74 @@
+From ac3b863c210b191f8298d428317369fa268897cc Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Sun, 27 Sep 2020 23:46:13 -0400
+Subject: [PATCH 19/47] Fix tso_segsz issue when vlan header is there
+
+Note: l2_len need consider vlan and qinq case.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 5104b45a6..e9afc6af1 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -103,6 +103,8 @@ COVERAGE_DEFINE(vhost_notification);
+  */
+ #define ETHER_HDR_MAX_LEN           (RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN \
+                                      + (2 * VLAN_HEADER_LEN))
++#define ETHER_VLAN_HDR_MAX_LEN      (RTE_ETHER_HDR_LEN + \
++                                     + (2 * VLAN_HEADER_LEN))
+ #define MTU_TO_FRAME_LEN(mtu)       ((mtu) + RTE_ETHER_HDR_LEN + \
+                                      RTE_ETHER_CRC_LEN)
+ #define MTU_TO_MAX_FRAME_LEN(mtu)   ((mtu) + ETHER_HDR_MAX_LEN)
+@@ -2226,7 +2228,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+      */
+     if (((mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) == 0) &&
+         (mbuf->l2_len == UDP_VXLAN_ETH_HDR_SIZE) &&
+-        (mbuf->pkt_len > (tso_segsz + ETH_HEADER_LEN))) {
++        (mbuf->pkt_len > (tso_segsz + ETHER_VLAN_HDR_MAX_LEN))) {
+         mbuf->ol_flags = 0;
+         mbuf->l2_len -= sizeof(struct udp_header)
+                         + sizeof(struct vxlanhdr);
+@@ -2353,7 +2355,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         /* In case of GRO, PKT_TX_TCP_SEG or PKT_TX_UDP_SEG wasn't set by GRO
+          * APIs, here is a place we can mark it.
+          */
+-        if ((mbuf->pkt_len > (tso_segsz + ETH_HEADER_LEN))
++        if ((mbuf->pkt_len > (tso_segsz + mbuf->l2_len))
+             && (!(mbuf->ol_flags & (PKT_TX_TCP_SEG | PKT_TX_UDP_SEG)))) {
+             if (l4_proto == IPPROTO_UDP) {
+                 mbuf->ol_flags |= PKT_TX_UDP_SEG;
+@@ -2416,7 +2418,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+     /* UDP GSO if necessary */
+     if (l4_proto == IPPROTO_UDP) {
+         /* in case of UFO and pkt_len < dev->mtu, GSO is unnecessary */
+-        if (mbuf->pkt_len < dev->mtu + ETH_HEADER_LEN) {
++        if (mbuf->pkt_len < dev->mtu + ETHER_VLAN_HDR_MAX_LEN) {
+             mbuf->ol_flags &= ~PKT_TX_UDP_SEG;
+             if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
+                 /* Pretend it as a normal UDP and stop inner cksum offload */
+@@ -2473,8 +2475,8 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             /* FOR GSO, gso_size includes l2_len + l3_len */
+             mbuf->tso_segsz = tso_segsz + mbuf->outer_l2_len
+                                   + mbuf->outer_l3_len + mbuf->l2_len;
+-            if (mbuf->tso_segsz > dev->mtu + ETH_HEADER_LEN) {
+-                mbuf->tso_segsz = dev->mtu + ETH_HEADER_LEN;
++            if (mbuf->tso_segsz > dev->mtu + ETHER_VLAN_HDR_MAX_LEN) {
++                mbuf->tso_segsz = dev->mtu + ETHER_VLAN_HDR_MAX_LEN;
+             }
+         }
+     }
+@@ -2708,6 +2710,7 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+                 } else {
+                     int j, k;
+                     struct rte_mbuf * next_part;
++
+                     nb_tx = ret;
+                     for (j = 0; j < nb_tx; j++) {
+                         set_multiseg_udptcp_cksum(gso_mbufs[j]);
+-- 
+2.17.1
+

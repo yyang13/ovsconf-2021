@@ -1,0 +1,322 @@
+From 137feced75cf9c28f33dd783015d7c16b842e305 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 30 Dec 2020 04:30:06 -0500
+Subject: [PATCH 36/47] Add IPv6 GSO support code
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 219 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 153 insertions(+), 66 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 4c8011c78..5596e703c 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -2498,53 +2498,68 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+         if ((mbuf->ol_flags & PKT_TX_UDP_SEG) ||
+             (mbuf->pkt_len > (tso_segsz + mbuf->outer_l2_len
+                                   + mbuf->outer_l3_len + mbuf->l2_len))) {
++            void *l3_hdr, *l4_hdr;
++            struct rte_udp_hdr *udp_hdr;
++            uint32_t inner_l2_len = mbuf->l2_len;
++            uint16_t eth_type;
++            bool is_frag = false;
++
+             dp_packet_hwol_set_udp_seg(pkt);
+ 
+-            /* For UDP GSO, udp checksum must be calculated by software */
+-            if ((mbuf->ol_flags & PKT_TX_L4_MASK) == PKT_TX_UDP_CKSUM) {
+-                void *l3_hdr, *l4_hdr;
+-                struct rte_udp_hdr *udp_hdr;
+-                uint32_t inner_l2_len = mbuf->l2_len;
+-                uint16_t eth_type;
++            /* PKT_TX_UDP_CKSUM must be cleaned for GSO because
++             * udp checksum only can be caculated by software for
++             * GSO case.
++             */
++            mbuf->ol_flags &= ~PKT_TX_UDP_CKSUM;
+ 
+-                /* PKT_TX_UDP_CKSUM must be cleaned for GSO because
+-                 * udp checksum only can be caculated by software for
+-                 * GSO case.
+-                 */
+-                mbuf->ol_flags &= ~PKT_TX_UDP_CKSUM;
+-
+-                if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
+-                    uint32_t inner_l2_offset = mbuf->outer_l2_len +
+-                                               mbuf->outer_l3_len +
+-                                               sizeof(struct udp_header) +
+-                                               sizeof(struct vxlanhdr);
+-                    inner_l2_len -= sizeof(struct udp_header) +
+-                                    sizeof(struct vxlanhdr);
+-                    eth_hdr = (struct rte_ether_hdr *)
+-                                  ((uint8_t *)eth_hdr + inner_l2_offset);
+-                }
++            if (mbuf->ol_flags & PKT_TX_TUNNEL_VXLAN) {
++                uint32_t inner_l2_offset = mbuf->outer_l2_len +
++                                           mbuf->outer_l3_len +
++                                           sizeof(struct udp_header) +
++                                           sizeof(struct vxlanhdr);
++                inner_l2_len -= sizeof(struct udp_header) +
++                                sizeof(struct vxlanhdr);
++                eth_hdr = (struct rte_ether_hdr *)
++                              ((uint8_t *)eth_hdr + inner_l2_offset);
++            }
+ 
+-                eth_type = eth_hdr->ether_type;
+-                if (eth_type_vlan((OVS_FORCE ovs_be16)eth_type)) {
+-                    struct rte_vlan_hdr *vlan_hdr =
+-                        (struct rte_vlan_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++            eth_type = eth_hdr->ether_type;
++            if (eth_type_vlan((OVS_FORCE ovs_be16)eth_type)) {
++                struct rte_vlan_hdr *vlan_hdr =
++                    (struct rte_vlan_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
+ 
+-                    eth_type = vlan_hdr->eth_proto;
+-                }
++                eth_type = vlan_hdr->eth_proto;
++            }
+ 
+-                l3_hdr = (uint8_t *)eth_hdr + inner_l2_len;
+-                l4_hdr = (uint8_t *)l3_hdr + mbuf->l3_len;
++            l3_hdr = (uint8_t *)eth_hdr + inner_l2_len;
++            l4_hdr = (uint8_t *)l3_hdr + mbuf->l3_len;
++            if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
+                 ip_hdr = (struct rte_ipv4_hdr *)l3_hdr;
+                 ip_hdr->hdr_checksum = 0;
+                 ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
+-                /* Don't touch UDP checksum if it is ip fragment */
+-                if (!rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
+-                    udp_hdr = (struct rte_udp_hdr *)l4_hdr;
+-                    /* Note: udp cksum must be zeroed on calculating it */
+-                    udp_hdr->dgram_cksum = 0;
++                if (rte_ipv4_frag_pkt_is_fragmented(ip_hdr)) {
++                    is_frag = true;
++                }
++            } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
++                ip6_hdr = (struct rte_ipv6_hdr *)l3_hdr;
++                if (ip6_hdr->proto == IPPROTO_FRAGMENT) {
++                    is_frag = true;
++                }
++            }
++            /* Don't touch UDP checksum if it is ip fragment */
++            if (!is_frag) {
++                /* Note: udp cksum must be zeroed on calculating it */
++                udp_hdr = (struct rte_udp_hdr *)l4_hdr;
++                udp_hdr->dgram_cksum = 0;
++                /* Note: for IPv6 udp checksum can't be 0. */
++                if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
+                     udp_hdr->dgram_cksum =
+                         get_udptcp_checksum(l3_hdr, l4_hdr, eth_type);
+                 }
++            } else {
++                VLOG_WARN_RL(&rl, "%s: GSO can't handle UDP fragment"
++                ", pkt_len = %u", dev->up.name, mbuf->pkt_len);
++                return false;
+             }
+ 
+             /* FOR GSO, gso_size includes l2_len + l3_len */
+@@ -2626,50 +2641,99 @@ __netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+     return cnt - nb_tx;
+ }
+ 
++#define UDP_VXLAN_HDR_SIZE 16
++
+ static inline void
+ set_multiseg_udptcp_cksum(struct rte_mbuf *mbuf)
+ {
+-    uint16_t l3_offset = mbuf->outer_l2_len + mbuf->outer_l3_len
+-                         + mbuf->l2_len;
+-    struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)
+-        (rte_pktmbuf_mtod(mbuf, char *) + l3_offset);
++    uint16_t l2_offset;
++    struct rte_ether_hdr *eth_hdr;
++    ovs_be16 eth_type;
++    uint16_t l3_offset;
++    struct rte_ipv4_hdr *ipv4_hdr;
++    struct rte_ipv6_hdr *ipv6_hdr = NULL;
+     struct rte_tcp_hdr *tcp_hdr;
+     uint32_t l4_hdr_len;
++    uint8_t *l3_hdr;
+     uint8_t *l4_hdr;
+     struct rte_mbuf *next = mbuf->next;
+     uint32_t cksum = 0;
+-    uint16_t l4_proto;
++    uint16_t l4_proto = 0;
+     uint32_t inner_cksum;
++    bool inner_is_ipv6_frag = false;
++
++    if (mbuf->outer_l2_len == 0) {
++        l2_offset = 0;
++    } else {
++        l2_offset = mbuf->outer_l2_len + mbuf->outer_l3_len
++                        + UDP_VXLAN_HDR_SIZE;
++    }
++
++    eth_hdr =
++        rte_pktmbuf_mtod_offset(mbuf, struct rte_ether_hdr *, l2_offset);
++    eth_type = (OVS_FORCE ovs_be16) eth_hdr->ether_type;
++    if (eth_type_vlan(eth_type)) {
++        struct rte_vlan_hdr *vlan_hdr =
++                        (struct rte_vlan_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++
++        eth_type = (OVS_FORCE ovs_be16) vlan_hdr->eth_proto;
++    }
++
++    if (mbuf->outer_l2_len == 0) {
++        l3_offset = l2_offset + mbuf->l2_len;
++    } else {
++        l3_offset = l2_offset - UDP_VXLAN_HDR_SIZE + mbuf->l2_len;
++    }
++    l3_hdr = rte_pktmbuf_mtod_offset(mbuf, uint8_t *, l3_offset);
++    if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
++        ipv4_hdr = (struct rte_ipv4_hdr *)l3_hdr;
++        l4_proto = ipv4_hdr->next_proto_id;
++    } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
++        ipv6_hdr = (struct rte_ipv6_hdr *)l3_hdr;
++        l4_proto = ipv6_hdr->proto;
++        if (l4_proto == IPPROTO_FRAGMENT) {
++            struct ovs_16aligned_ip6_frag *frag_hdr
++                = ALIGNED_CAST(struct ovs_16aligned_ip6_frag *,
++                               ipv6_hdr + 1);
++            l4_proto = frag_hdr->ip6f_nxt;
++            inner_is_ipv6_frag = true;
++        }
++    }
+ 
+-    l4_proto = ipv4_hdr->next_proto_id;
+     if ((l4_proto != IPPROTO_UDP) && (l4_proto != IPPROTO_TCP)) {
+         return;
+     }
+ 
++    /* Note: for IPv6 GSO, l3_len does not include fragment extension
++     * header length.
++     */
++    l4_hdr_len = mbuf->data_len - l3_offset - mbuf->l3_len;
++    l4_hdr = (uint8_t *)(l3_hdr + mbuf->l3_len);
++
+     if (l4_proto == IPPROTO_TCP) {
+         /* For TCP GSO, inner TCP header is in every seg,
+          * TCP checksum has to be calculated by software.
+          */
+-
+-        l4_hdr_len = mbuf->data_len - l3_offset
+-                     - sizeof(struct rte_ipv4_hdr);
+-        l4_hdr = (uint8_t *)(ipv4_hdr + 1);
+         tcp_hdr = (struct rte_tcp_hdr *)l4_hdr;
++        if (l4_proto == IPPROTO_FRAGMENT) {
++            tcp_hdr = (struct rte_tcp_hdr *)(l4_hdr
++                           + sizeof(struct ovs_16aligned_ip6_frag));
++        }
+         tcp_hdr->cksum = 0;
+     }
+ 
+-    /* Set inner ip checksum */
+-    ipv4_hdr->hdr_checksum = 0;
+-    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++    if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
++        /* Set inner ip checksum */
++        ipv4_hdr->hdr_checksum = 0;
++        ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++    }
+ 
+     if (l4_proto == IPPROTO_TCP) {
+         cksum = rte_raw_cksum(l4_hdr, l4_hdr_len);
+     } else if (l4_proto == IPPROTO_UDP) {
+         if (next == NULL) {
+-            /* It wasn't GSOed */
+-            cksum = rte_raw_cksum(ipv4_hdr + 1,
+-                                  ntohs(ipv4_hdr->total_length)
+-                                      - sizeof(struct rte_ipv4_hdr));
++            /* It wasn't GSOed, l4_hdr_len == l4_len */
++            cksum = rte_raw_cksum(l4_hdr, l4_hdr_len);
+         } else {
+             cksum = 0;
+         }
+@@ -2684,7 +2748,13 @@ set_multiseg_udptcp_cksum(struct rte_mbuf *mbuf)
+     /* Save cksum to inner_cksum, outer udp checksum needs it */
+     inner_cksum = cksum;
+ 
+-    cksum += rte_ipv4_phdr_cksum(ipv4_hdr, 0);
++    if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
++        cksum += rte_ipv4_phdr_cksum(ipv4_hdr, 0);
++    } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
++        cksum += rte_ipv6_phdr_cksum(ipv6_hdr, 0);
++        /* checksum for IPv6 fragment extension header */
++        cksum += rte_raw_cksum(ipv6_hdr + 1, IPV6_FRAG_HEADER_LEN);
++    }
+     cksum = ((cksum & 0xffff0000) >> 16) + (cksum & 0xffff);
+     cksum = (~cksum) & 0xffff;
+     if (cksum == 0) {
+@@ -2698,18 +2768,40 @@ set_multiseg_udptcp_cksum(struct rte_mbuf *mbuf)
+ 
+     /* Set outer udp checksum in case of VXLAN */
+     if (mbuf->outer_l2_len != 0) {
+-        ipv4_hdr = (struct rte_ipv4_hdr *)
+-            (rte_pktmbuf_mtod(mbuf, char *) + mbuf->outer_l2_len);
++        eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
++        l3_hdr = (uint8_t *)((char *)eth_hdr + mbuf->outer_l2_len);
+         struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)
+-            (ipv4_hdr + 1);
++            (l3_hdr + mbuf->outer_l3_len);
++
++        eth_type = (OVS_FORCE ovs_be16) eth_hdr->ether_type;
++        if (eth_type_vlan(eth_type)) {
++            struct rte_vlan_hdr *vlan_hdr =
++                (struct rte_vlan_hdr *)(eth_hdr + DPDK_RTE_HDR_OFFSET);
++
++            eth_type = (OVS_FORCE ovs_be16) vlan_hdr->eth_proto;
++        }
+ 
+         /* Set outer ip checksum */
+-        ipv4_hdr->hdr_checksum = 0;
+-        ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++        if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
++            ipv4_hdr = (struct rte_ipv4_hdr *)l3_hdr;
++            ipv4_hdr->hdr_checksum = 0;
++            ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
++        } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
++            ipv6_hdr = (struct rte_ipv6_hdr *)l3_hdr;
++        }
+ 
+         udp_hdr->dgram_cksum = 0;
+-        cksum = rte_ipv4_phdr_cksum(ipv4_hdr, 0);
+-        cksum += rte_raw_cksum(udp_hdr, mbuf->l2_len + mbuf->l3_len);
++        if (eth_type == htons(RTE_ETHER_TYPE_IPV4)) {
++            cksum = rte_ipv4_phdr_cksum(ipv4_hdr, 0);
++        } else if (eth_type == htons(RTE_ETHER_TYPE_IPV6)) {
++            cksum = rte_ipv6_phdr_cksum(ipv6_hdr, 0);
++        }
++        if (inner_is_ipv6_frag) {
++            cksum += rte_raw_cksum(udp_hdr, mbuf->l2_len + mbuf->l3_len
++                                                + IPV6_FRAG_HEADER_LEN);
++        } else {
++            cksum += rte_raw_cksum(udp_hdr, mbuf->l2_len + mbuf->l3_len);
++        }
+         cksum += inner_cksum;
+         if (l4_proto == IPPROTO_TCP) {
+             cksum += tcp_hdr->cksum;
+@@ -2786,8 +2878,7 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+                  */
+                 rte_pktmbuf_free(pkts[i]);
+                 if (ret >= 0) {
+-                    int j, k;
+-                    struct rte_mbuf * next_part;
++                    int j;
+ 
+                     nb_tx = ret;
+                     for (j = 0; j < nb_tx; j++) {
+@@ -2799,10 +2890,6 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
+                         gso_mbufs[j]->l2_len = 0;
+                         gso_mbufs[j]->l3_len = 0;
+                         gso_mbufs[j]->l4_len = 0;
+-                        next_part = gso_mbufs[j];
+-                        for (k = 0; k < gso_mbufs[j]->nb_segs; k++) {
+-                            next_part = next_part->next;
+-                        }
+                     }
+                     __netdev_dpdk_eth_tx_burst(dev, qid, gso_mbufs, nb_tx);
+                 }
+-- 
+2.17.1
+

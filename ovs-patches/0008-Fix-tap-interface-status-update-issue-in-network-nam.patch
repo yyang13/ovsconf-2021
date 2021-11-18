@@ -1,0 +1,884 @@
+From 5ef39ae88a0383a2523517893a9aa6f72ba62b8f Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 9 Sep 2020 21:57:30 -0500
+Subject: [PATCH 08/47] Fix tap interface status update issue in network
+ namespace
+
+Currently OVS can't get link state, mtu, mac, driver, etc.
+when tap interface is in network namespace, with netns option
+and netns helper functions, these info can be gotten.
+
+This patch fixed all these issues and make sure tap interface
+in network namespace can get same info as it is in root
+network namespace.
+
+Here is a result sample for reference:
+
+$ sudo ./ovs-vsctl list interface tap1
+_uuid               : 283b0daf-1baf-4d46-8a0e-3774eb39d0e3
+admin_state         : up
+bfd                 : {}
+bfd_status          : {}
+cfm_fault           : []
+cfm_fault_status    : []
+cfm_flap_count      : []
+cfm_health          : []
+cfm_mpid            : []
+cfm_remote_mpids    : []
+cfm_remote_opstate  : []
+duplex              : full
+error               : []
+external_ids        : {}
+ifindex             : 1276
+ingress_policing_burst: 0
+ingress_policing_rate: 0
+lacp_current        : []
+link_resets         : 1
+link_speed          : 10000000
+link_state          : up
+lldp                : {}
+mac                 : []
+mac_in_use          : "f6:8d:3f:0a:3a:dd"
+mtu                 : 1450
+mtu_request         : 1450
+name                : tap1
+ofport              : 4
+ofport_request      : []
+options             : {netns=ns01}
+other_config        : {}
+statistics          : {rx_bytes=726, rx_packets=9, tx_bytes=2178,...}
+status              : {driver_name=tun, driver_version="1.6",...}
+type                : tap
+$
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-linux.c     | 371 +++++++++++++++++++++++++++++++++++------
+ lib/socket-util-unix.c |  37 ++++
+ lib/socket-util.h      |   3 +
+ 3 files changed, 364 insertions(+), 47 deletions(-)
+
+diff --git a/lib/netdev-linux.c b/lib/netdev-linux.c
+index 0ac5f9b13..a6507202e 100644
+--- a/lib/netdev-linux.c
++++ b/lib/netdev-linux.c
+@@ -533,17 +533,19 @@ static int enter_netns(struct netns_knob *netns_knob, const char *netns);
+ static void exit_netns(struct netns_knob *netns_knob);
+ static int netdev_linux_do_ethtool(const char *name, struct ethtool_cmd *,
+                                    int cmd, const char *cmd_name);
+-static int get_flags(const struct netdev *, unsigned int *flags);
+-static int set_flags(const char *, unsigned int flags);
++static int get_flags(const struct netdev *, unsigned int *flags,
++                     bool is_tap_in_netns);
++static int set_flags(const char *, unsigned int flags, bool is_tap_in_netns);
+ static int update_flags(struct netdev_linux *netdev, enum netdev_flags off,
+-                        enum netdev_flags on, enum netdev_flags *old_flagsp)
++                        enum netdev_flags on, enum netdev_flags *old_flagsp,
++                        bool is_tap_in_netns)
+     OVS_REQUIRES(netdev->mutex);
+ static int get_ifindex(const struct netdev *, int *ifindexp);
+ static int do_set_addr(struct netdev *netdev,
+                        int ioctl_nr, const char *ioctl_name,
+-                       struct in_addr addr);
+-static int get_etheraddr(const char *netdev_name, struct eth_addr *ea);
+-static int set_etheraddr(const char *netdev_name, const struct eth_addr);
++                       struct in_addr addr, bool is_tap_in_netns);
++static int get_etheraddr(const struct netdev *netdev_, struct eth_addr *ea);
++static int set_etheraddr(const struct netdev *netdev_, const struct eth_addr);
+ static int af_packet_sock(void);
+ static bool netdev_linux_miimon_enabled(void);
+ static void netdev_linux_miimon_run(void);
+@@ -792,13 +794,28 @@ netdev_linux_run(const struct netdev_class *netdev_class OVS_UNUSED)
+                 struct netdev *netdev_ = node->data;
+                 struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+                 unsigned int flags;
++                struct netns_knob netns_knob;
++                bool is_tap_in_netns = false;
++
++                if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++                    is_tap_in_netns = true;
++                    error = enter_netns(&netns_knob, netdev->netns);
++                    if (error) {
++                        netdev_close(netdev_);
++                        continue;
++                    }
++                }
+ 
+                 ovs_mutex_lock(&netdev->mutex);
+-                get_flags(netdev_, &flags);
++                get_flags(netdev_, &flags, is_tap_in_netns);
+                 netdev_linux_changed(netdev, flags, 0);
+                 ovs_mutex_unlock(&netdev->mutex);
+ 
+                 netdev_close(netdev_);
++
++                if (is_tap_in_netns) {
++                    exit_netns(&netns_knob);
++                }
+             }
+             shash_destroy(&device_shash);
+         } else if (error != EAGAIN) {
+@@ -953,7 +970,7 @@ netdev_linux_construct(struct netdev *netdev_)
+         return error;
+     }
+ 
+-    error = get_flags(&netdev->up, &netdev->ifi_flags);
++    error = get_flags(&netdev->up, &netdev->ifi_flags, false);
+     if (error == ENODEV) {
+         if (netdev->up.netdev_class != &netdev_internal_class) {
+             /* The device does not exist, so don't allow it to be opened. */
+@@ -997,7 +1014,7 @@ netdev_linux_construct_tap(struct netdev *netdev_)
+     }
+ 
+     /* Create tap device. */
+-    get_flags(&netdev->up, &netdev->ifi_flags);
++    get_flags(&netdev->up, &netdev->ifi_flags, false);
+     ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+     if (userspace_tso_enabled()) {
+         ifr.ifr_flags |= IFF_VNET_HDR;
+@@ -1529,10 +1546,33 @@ static int
+ netdev_linux_rxq_drain(struct netdev_rxq *rxq_)
+ {
+     struct netdev_rxq_linux *rx = netdev_rxq_linux_cast(rxq_);
++    struct netdev *netdev_ = netdev_rxq_get_netdev(&rx->up);
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++    int error;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
++
+     if (rx->is_tap) {
+         struct ifreq ifr;
+-        int error = af_inet_ifreq_ioctl(netdev_rxq_get_name(rxq_), &ifr,
++        if (is_tap_in_netns) {
++            error = af_inet_ifreq_ioctl_netns(netdev_rxq_get_name(rxq_),
++                                              &ifr,
++                                              SIOCGIFTXQLEN, "SIOCGIFTXQLEN");
++        } else {
++            error = af_inet_ifreq_ioctl(netdev_rxq_get_name(rxq_), &ifr,
+                                         SIOCGIFTXQLEN, "SIOCGIFTXQLEN");
++        }
++        if (is_tap_in_netns) {
++            exit_netns(&netns_knob);
++        }
+         if (error) {
+             return error;
+         }
+@@ -1814,6 +1854,16 @@ netdev_linux_set_etheraddr(struct netdev *netdev_, const struct eth_addr mac)
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     enum netdev_flags old_flags = 0;
+     int error;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     if (netdev_linux_netnsid_is_remote(netdev)) {
+@@ -1831,9 +1881,9 @@ netdev_linux_set_etheraddr(struct netdev *netdev_, const struct eth_addr mac)
+ 
+     /* Tap devices must be brought down before setting the address. */
+     if (is_tap_netdev(netdev_)) {
+-        update_flags(netdev, NETDEV_UP, 0, &old_flags);
++        update_flags(netdev, NETDEV_UP, 0, &old_flags, is_tap_in_netns);
+     }
+-    error = set_etheraddr(netdev_get_name(netdev_), mac);
++    error = set_etheraddr(netdev_, mac);
+     if (!error || error == ENODEV) {
+         netdev->ether_addr_error = error;
+         netdev->cache_valid |= VALID_ETHERADDR;
+@@ -1843,11 +1893,16 @@ netdev_linux_set_etheraddr(struct netdev *netdev_, const struct eth_addr mac)
+     }
+ 
+     if (is_tap_netdev(netdev_) && old_flags & NETDEV_UP) {
+-        update_flags(netdev, 0, NETDEV_UP, &old_flags);
++        update_flags(netdev, 0, NETDEV_UP, &old_flags, is_tap_in_netns);
+     }
+ 
+ exit:
+     ovs_mutex_unlock(&netdev->mutex);
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -1857,6 +1912,16 @@ netdev_linux_get_etheraddr(const struct netdev *netdev_, struct eth_addr *mac)
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     int error;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     if (!(netdev->cache_valid & VALID_ETHERADDR)) {
+@@ -1865,17 +1930,23 @@ netdev_linux_get_etheraddr(const struct netdev *netdev_, struct eth_addr *mac)
+ 
+     if (!(netdev->cache_valid & VALID_ETHERADDR)) {
+         /* Fall back to ioctl if netlink fails */
+-        netdev->ether_addr_error = get_etheraddr(netdev_get_name(netdev_),
+-                                                 &netdev->etheraddr);
+-        netdev->cache_valid |= VALID_ETHERADDR;
++        netdev->ether_addr_error = get_etheraddr(netdev_, &netdev->etheraddr);
++        if (!netdev->ether_addr_error) {
++            netdev->cache_valid |= VALID_ETHERADDR;
++        }
+     }
+ 
+     error = netdev->ether_addr_error;
++
+     if (!error) {
+         *mac = netdev->etheraddr;
+     }
+     ovs_mutex_unlock(&netdev->mutex);
+ 
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -1883,6 +1954,11 @@ static int
+ netdev_linux_get_mtu__(struct netdev_linux *netdev, int *mtup)
+ {
+     int error;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(&netdev->up) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++    }
+ 
+     if (!(netdev->cache_valid & VALID_MTU)) {
+         netdev_linux_update_via_netlink(netdev);
+@@ -1892,8 +1968,13 @@ netdev_linux_get_mtu__(struct netdev_linux *netdev, int *mtup)
+         /* Fall back to ioctl if netlink fails */
+         struct ifreq ifr;
+ 
+-        netdev->netdev_mtu_error = af_inet_ifreq_ioctl(
+-            netdev_get_name(&netdev->up), &ifr, SIOCGIFMTU, "SIOCGIFMTU");
++        if (is_tap_in_netns) {
++            netdev->netdev_mtu_error = af_inet_ifreq_ioctl_netns(
++                netdev_get_name(&netdev->up), &ifr, SIOCGIFMTU, "SIOCGIFMTU");
++        } else {
++            netdev->netdev_mtu_error = af_inet_ifreq_ioctl(
++                netdev_get_name(&netdev->up), &ifr, SIOCGIFMTU, "SIOCGIFMTU");
++        }
+         netdev->mtu = ifr.ifr_mtu;
+         netdev->cache_valid |= VALID_MTU;
+     }
+@@ -1914,11 +1995,25 @@ netdev_linux_get_mtu(const struct netdev *netdev_, int *mtup)
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     int error;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     error = netdev_linux_get_mtu__(netdev, mtup);
+     ovs_mutex_unlock(&netdev->mutex);
+ 
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -1931,6 +2026,16 @@ netdev_linux_set_mtu(struct netdev *netdev_, int mtu)
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     struct ifreq ifr;
+     int error;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     if (netdev_linux_netnsid_is_remote(netdev)) {
+@@ -1955,8 +2060,13 @@ netdev_linux_set_mtu(struct netdev *netdev_, int mtu)
+         netdev->cache_valid &= ~VALID_MTU;
+     }
+     ifr.ifr_mtu = mtu;
+-    error = af_inet_ifreq_ioctl(netdev_get_name(netdev_), &ifr,
+-                                SIOCSIFMTU, "SIOCSIFMTU");
++    if (is_tap_in_netns) {
++        error = af_inet_ifreq_ioctl_netns(netdev_get_name(netdev_), &ifr,
++                                          SIOCSIFMTU, "SIOCSIFMTU");
++    } else {
++        error = af_inet_ifreq_ioctl(netdev_get_name(netdev_), &ifr,
++                                    SIOCSIFMTU, "SIOCSIFMTU");
++    }
+     if (!error || error == ENODEV) {
+         netdev->netdev_mtu_error = error;
+         netdev->mtu = ifr.ifr_mtu;
+@@ -1964,6 +2074,11 @@ netdev_linux_set_mtu(struct netdev *netdev_, int mtu)
+     }
+ exit:
+     ovs_mutex_unlock(&netdev->mutex);
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -2018,39 +2133,62 @@ netdev_linux_get_carrier_resets(const struct netdev *netdev_)
+ 
+ static int
+ netdev_linux_do_miimon(const char *name, int cmd, const char *cmd_name,
+-                       struct mii_ioctl_data *data)
++                       struct mii_ioctl_data *data, bool is_tap_in_netns)
+ {
+     struct ifreq ifr;
+     int error;
+ 
+     memset(&ifr, 0, sizeof ifr);
+     memcpy(&ifr.ifr_data, data, sizeof *data);
+-    error = af_inet_ifreq_ioctl(name, &ifr, cmd, cmd_name);
++    if (is_tap_in_netns) {
++        error = af_inet_ifreq_ioctl_netns(name, &ifr, cmd, cmd_name);
++    } else {
++        error = af_inet_ifreq_ioctl(name, &ifr, cmd, cmd_name);
++    }
+     memcpy(data, &ifr.ifr_data, sizeof *data);
+ 
+     return error;
+ }
+ 
+ static int
+-netdev_linux_get_miimon(const char *name, bool *miimon)
++netdev_linux_get_miimon(const struct netdev *netdev_, bool *miimon)
+ {
+     struct mii_ioctl_data data;
+     int error;
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++    const char *name = netdev_get_name(netdev_);
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            *miimon = false;
++            return error;
++        }
++    }
+ 
+     *miimon = false;
+ 
+     memset(&data, 0, sizeof data);
+-    error = netdev_linux_do_miimon(name, SIOCGMIIPHY, "SIOCGMIIPHY", &data);
++    error = netdev_linux_do_miimon(name, SIOCGMIIPHY, "SIOCGMIIPHY", &data,
++                                   is_tap_in_netns);
+     if (!error) {
+         /* data.phy_id is filled out by previous SIOCGMIIPHY miimon call. */
+         data.reg_num = MII_BMSR;
+         error = netdev_linux_do_miimon(name, SIOCGMIIREG, "SIOCGMIIREG",
+-                                       &data);
++                                       &data, is_tap_in_netns);
+ 
+         if (!error) {
+             *miimon = !!(data.val_out & BMSR_LSTATUS);
+         }
+     }
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     if (error) {
+         struct ethtool_cmd ecmd;
+ 
+@@ -2112,7 +2250,7 @@ netdev_linux_miimon_run(void)
+ 
+         ovs_mutex_lock(&dev->mutex);
+         if (dev->miimon_interval > 0 && timer_expired(&dev->miimon_timer)) {
+-            netdev_linux_get_miimon(dev->up.name, &miimon);
++            netdev_linux_get_miimon(netdev, &miimon);
+             if (miimon != dev->miimon) {
+                 dev->miimon = miimon;
+                 netdev_linux_changed(dev, dev->ifi_flags, 0);
+@@ -2542,7 +2680,9 @@ netdev_linux_read_features(struct netdev_linux *netdev)
+     }
+ 
+ out:
+-    netdev->cache_valid |= VALID_FEATURES;
++    if (!error) {
++        netdev->cache_valid |= VALID_FEATURES;
++    }
+     netdev->get_features_error = error;
+ }
+ 
+@@ -3270,6 +3410,16 @@ netdev_linux_set_in4(struct netdev *netdev_, struct in_addr address,
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     int error;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     if (netdev_linux_netnsid_is_remote(netdev)) {
+@@ -3277,16 +3427,22 @@ netdev_linux_set_in4(struct netdev *netdev_, struct in_addr address,
+         goto exit;
+     }
+ 
+-    error = do_set_addr(netdev_, SIOCSIFADDR, "SIOCSIFADDR", address);
++    error = do_set_addr(netdev_, SIOCSIFADDR, "SIOCSIFADDR", address,
++                        is_tap_in_netns);
+     if (!error) {
+         if (address.s_addr != INADDR_ANY) {
+             error = do_set_addr(netdev_, SIOCSIFNETMASK,
+-                                "SIOCSIFNETMASK", netmask);
++                                "SIOCSIFNETMASK", netmask, is_tap_in_netns);
+         }
+     }
+ 
+ exit:
+     ovs_mutex_unlock(&netdev->mutex);
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -3328,13 +3484,19 @@ make_in4_sockaddr(struct sockaddr *sa, struct in_addr addr)
+ 
+ static int
+ do_set_addr(struct netdev *netdev,
+-            int ioctl_nr, const char *ioctl_name, struct in_addr addr)
++            int ioctl_nr, const char *ioctl_name, struct in_addr addr,
++            bool is_tap_in_netns)
+ {
+     struct ifreq ifr;
+ 
+     make_in4_sockaddr(&ifr.ifr_addr, addr);
+-    return af_inet_ifreq_ioctl(netdev_get_name(netdev), &ifr, ioctl_nr,
+-                               ioctl_name);
++    if (is_tap_in_netns) {
++        return af_inet_ifreq_ioctl_netns(netdev_get_name(netdev), &ifr,
++                                         ioctl_nr, ioctl_name);
++    } else {
++        return af_inet_ifreq_ioctl(netdev_get_name(netdev), &ifr, ioctl_nr,
++                                   ioctl_name);
++    }
+ }
+ 
+ /* Adds 'router' as a default IP gateway. */
+@@ -3461,6 +3623,17 @@ netdev_linux_get_block_id(struct netdev *netdev_)
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     uint32_t block_id = 0;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++    int error;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return block_id;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     /* Ensure the linux netdev has had its fields populated. */
+@@ -3474,6 +3647,10 @@ netdev_linux_get_block_id(struct netdev *netdev_)
+     }
+     ovs_mutex_unlock(&netdev->mutex);
+ 
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return block_id;
+ }
+ 
+@@ -3544,7 +3721,8 @@ iff_to_nd_flags(unsigned int iff)
+ 
+ static int
+ update_flags(struct netdev_linux *netdev, enum netdev_flags off,
+-             enum netdev_flags on, enum netdev_flags *old_flagsp)
++             enum netdev_flags on, enum netdev_flags *old_flagsp,
++             bool is_tap_in_netns)
+     OVS_REQUIRES(netdev->mutex)
+ {
+     unsigned int old_flags, new_flags;
+@@ -3554,8 +3732,9 @@ update_flags(struct netdev_linux *netdev, enum netdev_flags off,
+     *old_flagsp = iff_to_nd_flags(old_flags);
+     new_flags = (old_flags & ~nd_to_iff_flags(off)) | nd_to_iff_flags(on);
+     if (new_flags != old_flags) {
+-        error = set_flags(netdev_get_name(&netdev->up), new_flags);
+-        get_flags(&netdev->up, &netdev->ifi_flags);
++        error = set_flags(netdev_get_name(&netdev->up), new_flags,
++                          is_tap_in_netns);
++        get_flags(&netdev->up, &netdev->ifi_flags, is_tap_in_netns);
+     }
+ 
+     return error;
+@@ -3567,6 +3746,16 @@ netdev_linux_update_flags(struct netdev *netdev_, enum netdev_flags off,
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
+     int error = 0;
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            return error;
++        }
++    }
+ 
+     ovs_mutex_lock(&netdev->mutex);
+     if (on || off) {
+@@ -3575,18 +3764,23 @@ netdev_linux_update_flags(struct netdev *netdev_, enum netdev_flags off,
+             error = EOPNOTSUPP;
+             goto exit;
+         }
+-        error = update_flags(netdev, off, on, old_flagsp);
++        error = update_flags(netdev, off, on, old_flagsp, is_tap_in_netns);
+     } else {
+         /* Try reading flags over netlink, or fall back to ioctl. */
+         if (!netdev_linux_update_via_netlink(netdev)) {
+             *old_flagsp = iff_to_nd_flags(netdev->ifi_flags);
+         } else {
+-            error = update_flags(netdev, off, on, old_flagsp);
++            error = update_flags(netdev, off, on, old_flagsp, is_tap_in_netns);
+         }
+     }
+ 
+ exit:
+     ovs_mutex_unlock(&netdev->mutex);
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+@@ -6373,13 +6567,19 @@ get_stats_via_netlink(const struct netdev *netdev_, struct netdev_stats *stats)
+ }
+ 
+ static int
+-get_flags(const struct netdev *dev, unsigned int *flags)
++get_flags(const struct netdev *dev, unsigned int *flags, bool is_tap_in_netns)
+ {
+     struct ifreq ifr;
+     int error;
+ 
+     *flags = 0;
+-    error = af_inet_ifreq_ioctl(dev->name, &ifr, SIOCGIFFLAGS, "SIOCGIFFLAGS");
++    if (is_tap_in_netns) {
++        error = af_inet_ifreq_ioctl_netns(dev->name, &ifr, SIOCGIFFLAGS,
++                                          "SIOCGIFFLAGS");
++    } else {
++        error = af_inet_ifreq_ioctl(dev->name, &ifr, SIOCGIFFLAGS,
++                                    "SIOCGIFFLAGS");
++    }
+     if (!error) {
+         *flags = ifr.ifr_flags;
+     }
+@@ -6387,12 +6587,17 @@ get_flags(const struct netdev *dev, unsigned int *flags)
+ }
+ 
+ static int
+-set_flags(const char *name, unsigned int flags)
++set_flags(const char *name, unsigned int flags, bool is_tap_in_netns)
+ {
+     struct ifreq ifr;
+ 
+     ifr.ifr_flags = flags;
+-    return af_inet_ifreq_ioctl(name, &ifr, SIOCSIFFLAGS, "SIOCSIFFLAGS");
++    if (is_tap_in_netns) {
++        return af_inet_ifreq_ioctl_netns(name, &ifr, SIOCSIFFLAGS,
++                                         "SIOCSIFFLAGS");
++    } else {
++        return af_inet_ifreq_ioctl(name, &ifr, SIOCSIFFLAGS, "SIOCSIFFLAGS");
++    }
+ }
+ 
+ int
+@@ -6421,6 +6626,19 @@ static int
+ get_ifindex(const struct netdev *netdev_, int *ifindexp)
+ {
+     struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++    int error;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            netdev->get_ifindex_error = -error;
++            netdev->ifindex = 0;
++            return netdev->get_ifindex_error;
++        }
++    }
+ 
+     if (!(netdev->cache_valid & VALID_IFINDEX)) {
+         netdev_linux_update_via_netlink(netdev);
+@@ -6441,6 +6659,11 @@ get_ifindex(const struct netdev *netdev_, int *ifindexp)
+     }
+ 
+     *ifindexp = netdev->ifindex;
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return netdev->get_ifindex_error;
+ }
+ 
+@@ -6452,6 +6675,11 @@ netdev_linux_update_via_netlink(struct netdev_linux *netdev)
+     struct rtnetlink_change chg;
+     struct rtnetlink_change *change = &chg;
+     int error;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(&netdev->up) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++    }
+ 
+     ofpbuf_init(&request, 0);
+     nl_msg_put_nlmsghdr(&request,
+@@ -6466,7 +6694,11 @@ netdev_linux_update_via_netlink(struct netdev_linux *netdev)
+     if (netdev_linux_netnsid_is_remote(netdev)) {
+         nl_msg_put_u32(&request, IFLA_IF_NETNSID, netdev->netnsid);
+     }
+-    error = nl_transact(NETLINK_ROUTE, &request, &reply);
++    if (is_tap_in_netns) {
++        error = nl_transact_nopool(NETLINK_ROUTE, &request, &reply);
++    } else {
++        error = nl_transact(NETLINK_ROUTE, &request, &reply);
++    }
+     ofpbuf_uninit(&request);
+     if (error) {
+         ofpbuf_delete(reply);
+@@ -6521,16 +6753,27 @@ netdev_linux_update_via_netlink(struct netdev_linux *netdev)
+ }
+ 
+ static int
+-get_etheraddr(const char *netdev_name, struct eth_addr *ea)
++get_etheraddr(const struct netdev *netdev_, struct eth_addr *ea)
+ {
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    const char *netdev_name = netdev_get_name(netdev_);
+     struct ifreq ifr;
+     int hwaddr_family;
+     int error;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++    }
+ 
+     memset(&ifr, 0, sizeof ifr);
+     ovs_strzcpy(ifr.ifr_name, netdev_name, sizeof ifr.ifr_name);
+     COVERAGE_INC(netdev_get_hwaddr);
+-    error = af_inet_ioctl(SIOCGIFHWADDR, &ifr);
++    if (is_tap_in_netns) {
++        error = af_inet_ioctl_netns(SIOCGIFHWADDR, &ifr);
++    } else {
++        error = af_inet_ioctl(SIOCGIFHWADDR, &ifr);
++    }
+     if (error) {
+         /* ENODEV probably means that a vif disappeared asynchronously and
+          * hasn't been removed from the database yet, so reduce the log level
+@@ -6552,17 +6795,28 @@ get_etheraddr(const char *netdev_name, struct eth_addr *ea)
+ }
+ 
+ static int
+-set_etheraddr(const char *netdev_name, const struct eth_addr mac)
++set_etheraddr(const struct netdev *netdev_, const struct eth_addr mac)
+ {
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    const char *netdev_name = netdev_get_name(netdev_);
+     struct ifreq ifr;
+     int error;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++    }
+ 
+     memset(&ifr, 0, sizeof ifr);
+     ovs_strzcpy(ifr.ifr_name, netdev_name, sizeof ifr.ifr_name);
+     ifr.ifr_hwaddr.sa_family = ARPHRD_ETHER;
+     memcpy(ifr.ifr_hwaddr.sa_data, &mac, ETH_ADDR_LEN);
+     COVERAGE_INC(netdev_set_hwaddr);
+-    error = af_inet_ioctl(SIOCSIFHWADDR, &ifr);
++    if (is_tap_in_netns) {
++        error = af_inet_ioctl_netns(SIOCSIFHWADDR, &ifr);
++    } else {
++        error = af_inet_ioctl(SIOCSIFHWADDR, &ifr);
++    }
+     if (error) {
+         VLOG_ERR("ioctl(SIOCSIFHWADDR) on %s device failed: %s",
+                  netdev_name, ovs_strerror(error));
+@@ -6576,13 +6830,31 @@ netdev_linux_do_ethtool(const char *name, struct ethtool_cmd *ecmd,
+ {
+     struct ifreq ifr;
+     int error;
++    struct netdev *netdev_ = netdev_from_name(name);
++    struct netdev_linux *netdev = netdev_linux_cast(netdev_);
++    struct netns_knob netns_knob;
++    bool is_tap_in_netns = false;
++
++    if (is_tap_netdev(netdev_) && (netdev->netns != NULL)) {
++        is_tap_in_netns = true;
++        error = enter_netns(&netns_knob, netdev->netns);
++        if (error) {
++            netdev_close(netdev_);
++            return error;
++        }
++    }
++    netdev_close(netdev_);
+ 
+     memset(&ifr, 0, sizeof ifr);
+     ovs_strzcpy(ifr.ifr_name, name, sizeof ifr.ifr_name);
+     ifr.ifr_data = (caddr_t) ecmd;
+ 
+     ecmd->cmd = cmd;
+-    error = af_inet_ioctl(SIOCETHTOOL, &ifr);
++    if (is_tap_in_netns) {
++        error = af_inet_ioctl_netns(SIOCETHTOOL, &ifr);
++    } else {
++        error = af_inet_ioctl(SIOCETHTOOL, &ifr);
++    }
+     if (error) {
+         if (error != EOPNOTSUPP) {
+             VLOG_WARN_RL(&rl, "ethtool command %s on network device %s "
+@@ -6592,6 +6864,11 @@ netdev_linux_do_ethtool(const char *name, struct ethtool_cmd *ecmd,
+              * common, so there's no point in logging anything. */
+         }
+     }
++
++    if (is_tap_in_netns) {
++        exit_netns(&netns_knob);
++    }
++
+     return error;
+ }
+ 
+diff --git a/lib/socket-util-unix.c b/lib/socket-util-unix.c
+index 59f63fcce..4923461bd 100644
+--- a/lib/socket-util-unix.c
++++ b/lib/socket-util-unix.c
+@@ -418,6 +418,27 @@ af_inet_ioctl(unsigned long int command, const void *arg)
+             : 0);
+ }
+ 
++int
++af_inet_ioctl_netns(unsigned long int command, const void *arg)
++{
++    int sock;
++    int error = 0;
++
++    sock = socket(AF_INET, SOCK_DGRAM, 0);
++    if (sock < 0) {
++        error = -sock_errno();
++        VLOG_ERR("failed to create inet socket: %s", sock_strerror(error));
++    }
++
++    if (sock >= 0) {
++        if (ioctl(sock, command, arg) == -1) {
++            error = errno;
++        }
++        close(sock);
++    }
++    return error;
++}
++
+ int
+ af_inet_ifreq_ioctl(const char *name, struct ifreq *ifr, unsigned long int cmd,
+                     const char *cmd_name)
+@@ -433,3 +454,19 @@ af_inet_ifreq_ioctl(const char *name, struct ifreq *ifr, unsigned long int cmd,
+     }
+     return error;
+ }
++
++int
++af_inet_ifreq_ioctl_netns(const char *name, struct ifreq *ifr,
++                          unsigned long int cmd, const char *cmd_name)
++{
++    int error;
++
++    ovs_strzcpy(ifr->ifr_name, name, sizeof ifr->ifr_name);
++    error = af_inet_ioctl_netns(cmd, ifr);
++    if (error) {
++        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
++        VLOG_DBG_RL(&rl, "%s: ioctl(%s) failed: %s", name, cmd_name,
++                    ovs_strerror(error));
++    }
++    return error;
++}
+diff --git a/lib/socket-util.h b/lib/socket-util.h
+index 9ccb7d4cc..d92e4c479 100644
+--- a/lib/socket-util.h
++++ b/lib/socket-util.h
+@@ -140,6 +140,9 @@ struct ifreq;
+ int af_inet_ioctl(unsigned long int command, const void *arg);
+ int af_inet_ifreq_ioctl(const char *name, struct ifreq *,
+                         unsigned long int cmd, const char *cmd_name);
++int af_inet_ioctl_netns(unsigned long int command, const void *arg);
++int af_inet_ifreq_ioctl_netns(const char *name, struct ifreq *,
++                              unsigned long int cmd, const char *cmd_name);
+ 
+ #define closesocket close
+ #endif
+-- 
+2.17.1
+

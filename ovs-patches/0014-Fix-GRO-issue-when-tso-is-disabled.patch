@@ -1,0 +1,176 @@
+From cfc798a4ae8cdbc4b7f43ba3d5c0175054d2119a Mon Sep 17 00:00:00 2001
+From: Yi Yang <yangyi01@inspur.com>
+Date: Wed, 26 Aug 2020 23:54:07 -0400
+Subject: [PATCH 14/47] Fix GRO issue when tso is disabled
+
+If tso is disabled, TCP and UDP can't work normally,
+the issue lies in GRO, it shouldn't be done at all if
+tso is disabled.
+
+Signed-off-by: Yi Yang <yangyi01@inspur.com>
+---
+ lib/netdev-dpdk.c | 132 ++++++++++++++++++++++++----------------------
+ 1 file changed, 70 insertions(+), 62 deletions(-)
+
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index a3d05b6a6..6d0316f75 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -3032,27 +3032,30 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
+     int nb_udp_rx = 0;
+     int nb_other_rx = 0;
+ 
+-    /* Initialize GRO parameters */
+-    gro_param.gro_types = RTE_GRO_TCP_IPV4 |
+-                          RTE_GRO_UDP_IPV4 |
+-                          RTE_GRO_IPV4_VXLAN_TCP_IPV4 |
+-                          RTE_GRO_IPV4_VXLAN_UDP_IPV4;
+-    gro_param.max_flow_num = 1024;
+-    /* There are 46 fragments for a 64K big packet */
+-    gro_param.max_item_per_flow = NETDEV_MAX_BURST * 2;
+-
+-    /* Initialize GRO context */
+-    if (RTE_PER_LCORE(_gro_ctx) == NULL) {
+-        uint32_t cpu, node;
+-        int ret;
+-
+-        ret = syscall(__NR_getcpu, &cpu, &node, NULL);
+-        if (ret == 0) {
+-            gro_param.socket_id = node;
+-        } else {
+-            gro_param.socket_id = 0;
++    /* Do GRO only if tso is enabled */
++    if (userspace_tso_enabled()) {
++        /* Initialize GRO parameters */
++        gro_param.gro_types = RTE_GRO_TCP_IPV4 |
++                              RTE_GRO_UDP_IPV4 |
++                              RTE_GRO_IPV4_VXLAN_TCP_IPV4 |
++                              RTE_GRO_IPV4_VXLAN_UDP_IPV4;
++        gro_param.max_flow_num = 1024;
++        /* There are 46 fragments for a 64K big packet */
++        gro_param.max_item_per_flow = NETDEV_MAX_BURST * 2;
++
++        /* Initialize GRO context */
++        if (RTE_PER_LCORE(_gro_ctx) == NULL) {
++            uint32_t cpu, node;
++            int ret;
++
++            ret = syscall(__NR_getcpu, &cpu, &node, NULL);
++            if (ret == 0) {
++                gro_param.socket_id = node;
++            } else {
++                gro_param.socket_id = 0;
++            }
++            RTE_PER_LCORE(_gro_ctx) = rte_gro_ctx_create(&gro_param);
+         }
+-        RTE_PER_LCORE(_gro_ctx) = rte_gro_ctx_create(&gro_param);
+     }
+ 
+     if (OVS_UNLIKELY(!(dev->flags & NETDEV_UP))) {
+@@ -3082,56 +3085,61 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
+         rte_spinlock_unlock(&dev->stats_lock);
+     }
+ 
+-    /* Need to parse packet header and set necessary fields in mbuf for GRO */
+     batch->count = nb_rx;
+-    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+-        uint16_t l4_proto = 0;
+-        int is_frag = 0;
+-
+-        netdev_dpdk_parse_hdr(packet, 0, &l4_proto, &is_frag);
+-        if (packet->mbuf.packet_type & RTE_PTYPE_TUNNEL_VXLAN) {
+-            if (packet->mbuf.packet_type & RTE_PTYPE_INNER_L4_UDP) {
+-                udp_pkts[nb_udp_rx++] = packet;
+-            } else {
+-                other_pkts[nb_other_rx++] = packet;
+-            }
+-        } else {
+-            if (packet->mbuf.packet_type & RTE_PTYPE_L4_UDP) {
+-                udp_pkts[nb_udp_rx++] = packet;
++
++    /* Do GRO only if tso is enabled */
++    if (userspace_tso_enabled()) {
++        /* Need to parse packet header and set necessary fields for GRO */
++        DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
++            uint16_t l4_proto = 0;
++            int is_frag = 0;
++
++            netdev_dpdk_parse_hdr(packet, 0, &l4_proto, &is_frag);
++            if (packet->mbuf.packet_type & RTE_PTYPE_TUNNEL_VXLAN) {
++                if (packet->mbuf.packet_type & RTE_PTYPE_INNER_L4_UDP) {
++                    udp_pkts[nb_udp_rx++] = packet;
++                } else {
++                    other_pkts[nb_other_rx++] = packet;
++                }
+             } else {
+-                other_pkts[nb_other_rx++] = packet;
++                if (packet->mbuf.packet_type & RTE_PTYPE_L4_UDP) {
++                    udp_pkts[nb_udp_rx++] = packet;
++                } else {
++                    other_pkts[nb_other_rx++] = packet;
++                }
+             }
+         }
+-    }
+ 
+-    /* Do GRO here if needed, note: IP fragment can be out of order */
+-    if (nb_udp_rx) {
+-        /* UDP packet must use heavy rte_gro_reassemble */
+-        nb_udp_rx = rte_gro_reassemble((struct rte_mbuf **) udp_pkts,
+-                                       nb_udp_rx, RTE_PER_LCORE(_gro_ctx));
+-        nb_udp_rx += rte_gro_timeout_flush(RTE_PER_LCORE(_gro_ctx), 10000,
+-                          RTE_GRO_UDP_IPV4
+-                              | RTE_GRO_IPV4_VXLAN_UDP_IPV4,
+-                          (struct rte_mbuf **)&udp_pkts[nb_udp_rx],
+-                          NETDEV_MAX_BURST - nb_udp_rx);
+-    }
++        /* Do GRO here if needed, note: IP fragment can be out of order */
++        if (nb_udp_rx) {
++            /* UDP packet must use heavy rte_gro_reassemble */
++            nb_udp_rx = rte_gro_reassemble((struct rte_mbuf **) udp_pkts,
++                                           nb_udp_rx, RTE_PER_LCORE(_gro_ctx));
++            nb_udp_rx += rte_gro_timeout_flush(RTE_PER_LCORE(_gro_ctx), 10000,
++                              RTE_GRO_UDP_IPV4
++                                  | RTE_GRO_IPV4_VXLAN_UDP_IPV4,
++                              (struct rte_mbuf **)&udp_pkts[nb_udp_rx],
++                              NETDEV_MAX_BURST - nb_udp_rx);
++        }
+ 
+-    if (nb_other_rx) {
+-        /* TCP packet is better for lightweigh rte_gro_reassemble_burst */
+-        nb_other_rx = rte_gro_reassemble_burst((struct rte_mbuf **) other_pkts,
+-                                         nb_other_rx,
+-                                         &gro_param);
+-    }
++        if (nb_other_rx) {
++            /* TCP packet is better for lightweigh rte_gro_reassemble_burst */
++            nb_other_rx = rte_gro_reassemble_burst(
++                                             (struct rte_mbuf **) other_pkts,
++                                             nb_other_rx,
++                                             &gro_param);
++        }
+ 
+-    batch->count = nb_udp_rx + nb_other_rx;
+-    if (nb_udp_rx) {
+-        memcpy(batch->packets, udp_pkts,
+-               nb_udp_rx * sizeof(struct dp_packet *));
+-    }
++        batch->count = nb_udp_rx + nb_other_rx;
++        if (nb_udp_rx) {
++            memcpy(batch->packets, udp_pkts,
++                   nb_udp_rx * sizeof(struct dp_packet *));
++        }
+ 
+-    if (nb_other_rx) {
+-        memcpy(&batch->packets[nb_udp_rx], other_pkts,
+-               nb_other_rx * sizeof(struct dp_packet *));
++        if (nb_other_rx) {
++            memcpy(&batch->packets[nb_udp_rx], other_pkts,
++                   nb_other_rx * sizeof(struct dp_packet *));
++        }
+     }
+ 
+     dp_packet_batch_init_packet_fields(batch);
+-- 
+2.17.1
+
